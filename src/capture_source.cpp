@@ -25,6 +25,7 @@ namespace capture_source {
     int stream_depth {0};  ///< Number of streaming capture threads that should honor the active target.
     std::optional<geometry_t> geometry;  ///< Latest captured window origin.
     std::int32_t focused_pid {0};  ///< Process that should receive remote keyboard input.
+    std::uint32_t focused_window {0};  ///< Window that should stay behind the desktop while that process receives input.
     std::function<std::vector<window_t>()> windows_provider;  ///< Platform window enumeration.
     std::function<std::vector<application_t>()> applications_provider;  ///< Platform application enumeration.
     std::function<void()> focus_provider;  ///< Platform focus handler.
@@ -313,6 +314,7 @@ namespace capture_source {
     active_target = {};
     geometry.reset();
     focused_pid = 0;
+    focused_window = 0;
     audio_is_open = false;
     audio_samples.clear();
     audio_available.notify_all();
@@ -361,6 +363,16 @@ namespace capture_source {
   std::int32_t focus_pid() {
     std::lock_guard lock {state_mutex};
     return focused_pid;
+  }
+
+  void set_focus_window(std::uint32_t window_id) {
+    std::lock_guard lock {state_mutex};
+    focused_window = window_id;
+  }
+
+  std::uint32_t focus_window() {
+    std::lock_guard lock {state_mutex};
+    return focused_window;
   }
 
   void focus_active_target() {

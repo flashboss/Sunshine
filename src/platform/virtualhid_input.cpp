@@ -124,6 +124,35 @@ namespace platf::virtualhid {
      * @param touch_port Sunshine desktop and display geometry.
      * @return Full virtual-desktop bounds followed by the streamed viewport.
      */
+    /**
+     * @brief Shrink a window viewport until it lies inside the desktop.
+     *
+     * A window can extend past the visible desktop. The virtual mouse rejects that viewport and then stops sending motion.
+     *
+     * @param desktop Desktop that must contain the result.
+     * @param viewport Window bounds to clamp.
+     * @return Viewport inside the desktop, or the desktop when the window misses it entirely.
+     */
+    lvh::PointerViewport contained_viewport(const lvh::PointerViewport &desktop, lvh::PointerViewport viewport) {
+      if (desktop.width <= 0 || desktop.height <= 0 || viewport.width <= 0 || viewport.height <= 0) {
+        return viewport;
+      }
+
+      const auto left = std::max(viewport.offset_x, desktop.offset_x);
+      const auto top = std::max(viewport.offset_y, desktop.offset_y);
+      const auto right = std::min(viewport.offset_x + viewport.width, desktop.offset_x + desktop.width);
+      const auto bottom = std::min(viewport.offset_y + viewport.height, desktop.offset_y + desktop.height);
+      if (right <= left || bottom <= top) {
+        return desktop;
+      }
+
+      viewport.offset_x = left;
+      viewport.offset_y = top;
+      viewport.width = right - left;
+      viewport.height = bottom - top;
+      return viewport;
+    }
+
     std::pair<lvh::PointerViewport, lvh::PointerViewport> pointer_viewports(const touch_port_t &touch_port) {
       const lvh::PointerViewport desktop {
         .offset_x = touch_port.env_offset_x,
@@ -138,12 +167,15 @@ namespace platf::virtualhid {
 
       return {
         desktop,
-        {
-          .offset_x = touch_port.offset_x,
-          .offset_y = touch_port.offset_y,
-          .width = touch_port.logical_width,
-          .height = touch_port.logical_height,
-        },
+        contained_viewport(
+          desktop,
+          {
+            .offset_x = touch_port.offset_x,
+            .offset_y = touch_port.offset_y,
+            .width = touch_port.logical_width,
+            .height = touch_port.logical_height,
+          }
+        ),
       };
     }
 
@@ -547,10 +579,11 @@ namespace platf::virtualhid {
   }
 
   void input_context_t::refresh_mouse(const lvh::PointerViewport &desktop, const lvh::PointerViewport &viewport) {
-    mouse.reset();
-    mouse_desktop = desktop;
-    mouse_viewport = viewport;
+    auto previous_mouse = std::move(mouse);
+    const auto previous_desktop = mouse_desktop;
+    const auto previous_viewport = mouse_viewport;
     if (!runtime || !runtime->capabilities().supports_mouse) {
+      mouse = std::move(previous_mouse);
       return;
     }
 
@@ -562,9 +595,15 @@ namespace platf::virtualhid {
     auto created = runtime->create_mouse(options);
     if (created) {
       mouse = std::move(created.mouse);
-    } else {
-      log_failure("create libvirtualhid mouse"sv, created.status);
+      mouse_desktop = desktop;
+      mouse_viewport = viewport;
+      return;
     }
+
+    mouse = std::move(previous_mouse);
+    mouse_desktop = previous_desktop;
+    mouse_viewport = previous_viewport;
+    log_failure("create libvirtualhid mouse"sv, created.status);
   }
 
   void input_context_t::update_mouse_viewport(const touch_port_t &touch_port) {
@@ -1097,6 +1136,24 @@ namespace platf::virtualhid {
 
 }  // namespace platf::virtualhid
 
+#if defined(__APPLE__)
+namespace lvh::detail::macos {
+  /**
+   * @brief Send later CoreGraphics events to one process without activating it.
+   *
+   * @param pid Process id, or zero to deliver events to whichever application is active.
+   */
+  void set_event_target_pid(std::int32_t pid);
+
+  /**
+   * @brief Aim later mouse events at one captured window.
+   *
+   * @param window_id Platform window id, or zero to leave hit testing unchanged.
+   */
+  void set_event_target_window(std::uint32_t window_id);
+}  // namespace lvh::detail::macos
+#endif
+
 namespace platf {
 
 #ifndef _WIN32
@@ -1152,42 +1209,72 @@ namespace platf {
   }
 #endif
 
-  void move_mouse(input_t &input, int deltaX, int deltaY) {
+  /**
+   * @brief Aim remote input at the captured process without switching desktops.
+   */
+  void route_remote_input() {
     capture_source::focus_active_target();
+#if defined(__APPLE__)
+    lvh::detail::macos::set_event_target_pid(capture_source::focus_pid());
+    lvh::detail::macos::set_event_target_window(capture_source::focus_window());
+#endif
+  }
+
+  /**
+   * @brief Put the captured window back behind the local desktop after an event is posted.
+   *
+   * A click can order the window forward after it has been sent.
+   */
+  void settle_remote_input() {
+    capture_source::focus_active_target();
+  }
+
+  void move_mouse(input_t &input, int deltaX, int deltaY) {
+    route_remote_input();
     virtualhid::move_mouse(virtualhid::get_input_context(input), deltaX, deltaY);
+    settle_remote_input();
   }
 
   void move_mouse(input_t &input, const touch_port_t &touch_port, int deltaX, int deltaY) {
-    capture_source::focus_active_target();
+    route_remote_input();
     virtualhid::move_mouse(virtualhid::get_input_context(input), touch_port, deltaX, deltaY);
+    settle_remote_input();
   }
 
   void abs_mouse(input_t &input, const touch_port_t &touch_port, float x, float y) {
-    capture_source::focus_active_target();
+    route_remote_input();
     virtualhid::abs_mouse(virtualhid::get_input_context(input), touch_port, x, y);
+    settle_remote_input();
   }
 
   void button_mouse(input_t &input, int button, bool release) {
-    capture_source::focus_active_target();
+    route_remote_input();
     virtualhid::button_mouse(virtualhid::get_input_context(input), button, release);
+    settle_remote_input();
   }
 
   void scroll(input_t &input, int high_res_distance) {
+    route_remote_input();
     virtualhid::scroll(virtualhid::get_input_context(input), high_res_distance);
+    settle_remote_input();
   }
 
   void hscroll(input_t &input, int high_res_distance) {
+    route_remote_input();
     virtualhid::hscroll(virtualhid::get_input_context(input), high_res_distance);
+    settle_remote_input();
   }
 
   void keyboard_update(input_t &input, uint16_t modcode, bool release, uint8_t flags, bool extended) {
-    capture_source::focus_active_target();
+    route_remote_input();
     virtualhid::keyboard_update(virtualhid::get_input_context(input), modcode, release, flags, extended);
+    settle_remote_input();
   }
 
   void unicode(input_t &input, const char *utf8, int size) {
-    capture_source::focus_active_target();
+    route_remote_input();
     virtualhid::unicode(virtualhid::get_input_context(input), utf8, size);
+    settle_remote_input();
   }
 
   void touch_update(client_input_t *input, const touch_port_t &touch_port, const touch_input_t &touch) {

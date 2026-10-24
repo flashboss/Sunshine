@@ -8,6 +8,7 @@
 #include <atomic>
 #include <bitset>
 #include <list>
+#include <mutex>
 #include <thread>
 #include <utility>
 
@@ -1721,7 +1722,9 @@ namespace video {
     while (capture_ctx_queue->running()) {
       bool artificial_reinit = false;
 
-      auto push_captured_image_callback = [&capture_ctxs, &capture_ctx_queue, &switch_display_event, &artificial_reinit](std::shared_ptr<platf::img_t> &&img, bool frame_captured) {
+      auto callback_lock = std::make_shared<std::mutex>();
+    auto push_captured_image_callback = [&capture_ctxs, &capture_ctx_queue, &switch_display_event, &artificial_reinit, callback_lock](std::shared_ptr<platf::img_t> &&img, bool frame_captured) {
+      std::lock_guard guard {*callback_lock};
         KITTY_WHILE_LOOP(auto capture_ctx = std::begin(capture_ctxs), capture_ctx != std::end(capture_ctxs), {
           if (!capture_ctx->images->running()) {
             capture_ctx = capture_ctxs.erase(capture_ctx);
@@ -2757,6 +2760,14 @@ namespace video {
     auto ec = platf::capture_e::ok;
     while (encode_session_ctx_queue.running()) {
       auto push_captured_image_callback = [&](std::shared_ptr<platf::img_t> &&captured_image, bool frame_captured) {
+        if (!captured_image) {
+          for (auto &ctx : synced_session_ctxs) {
+            if (ctx->shutdown_event->peek()) {
+              return false;
+            }
+          }
+          return encode_session_ctx_queue.running();
+        }
         while (encode_session_ctx_queue.peek()) {
           auto encode_session_ctx = encode_session_ctx_queue.pop();
           if (!encode_session_ctx) {

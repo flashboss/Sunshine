@@ -762,6 +762,10 @@ namespace input {
 
     touch_port.offset_x = geometry->x;
     touch_port.offset_y = geometry->y;
+    if (geometry->width > 0 && geometry->height > 0) {
+      touch_port.logical_width = geometry->width;
+      touch_port.logical_height = geometry->height;
+    }
   }
 
   platf::touch_port_t platform_touch_port(const input::touch_port_t &touch_port) {

@@ -224,7 +224,21 @@ namespace capture_source {
   std::int32_t focus_pid();
 
   /**
-   * @brief Bring the captured application forward when a remote input event arrives.
+   * @brief Remember which captured window should stay behind the local desktop.
+   *
+   * @param window_id Platform window id, or zero when display capture is active.
+   */
+  void set_focus_window(std::uint32_t window_id);
+
+  /**
+   * @brief Return the captured window that should stay behind the local desktop.
+   *
+   * @return Window id, or zero when display capture is active.
+   */
+  std::uint32_t focus_window();
+
+  /**
+   * @brief Let the captured application receive remote input without covering the desktop.
    */
   void focus_active_target();
 

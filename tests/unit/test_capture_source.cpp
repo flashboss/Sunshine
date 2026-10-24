@@ -157,3 +157,14 @@ TEST(CaptureSourceTest, AppsJsonSelectsWindowCapture) {
   ASSERT_TRUE(apps[0].capture.show_cursor.has_value());
   EXPECT_FALSE(*apps[0].capture.show_cursor);
 }
+
+TEST(CaptureSourceTest, RemembersTheWindowThatShouldStayBehindTheDesktop) {
+  capture_source::set_focus_window(0);
+  EXPECT_EQ(capture_source::focus_window(), 0U);
+
+  capture_source::set_focus_window(42);
+  EXPECT_EQ(capture_source::focus_window(), 42U);
+
+  capture_source::set_focus_window(0);
+  EXPECT_EQ(capture_source::focus_window(), 0U);
+}
