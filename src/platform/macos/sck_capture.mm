@@ -904,6 +904,10 @@ namespace platf {
       const auto target = capture_source::stream_target();
       @autoreleasepool {
         SCShareableContent *content = copy_shareable_content();
+        if (content == nil) {
+          // Enumeration timed out or failed. Keep streaming the current window instead of ending the session.
+          return true;
+        }
         const auto snapshots = snapshots_from(content);
         std::optional<capture_source::match_t> matched;
         if (match.window_id != 0) {
