@@ -22,9 +22,7 @@
 
 // platform includes
 #import <AppKit/AppKit.h>
-#import <CoreGraphics/CoreGraphics.h>
 #import <CoreMedia/CoreMedia.h>
-#import <CoreVideo/CoreVideo.h>
 #import <ScreenCaptureKit/ScreenCaptureKit.h>
 
 // local includes
@@ -132,121 +130,6 @@ namespace platf {
       if (status != noErr) {
         return nullptr;
       }
-      return sample;
-    }
-
-    /**
-     * @brief Load the legacy window-image API that the macOS 15 SDK marks unavailable.
-     *
-     * @return Function pointer, or null when the symbol is missing.
-     */
-    auto window_list_create_image() {
-      using fn_t = CGImageRef (*)(CGRect, CGWindowListOption, CGWindowID, CGWindowImageOption);
-      static const fn_t fn = reinterpret_cast<fn_t>(dlsym(RTLD_DEFAULT, "CGWindowListCreateImage"));
-      return fn;
-    }
-
-    /**
-     * @brief Turn a CGImage into a video sample at the stream resolution.
-     *
-     * @param image Source image. Retained ownership stays with the caller.
-     * @param pixel_width Output width.
-     * @param pixel_height Output height.
-     * @param format CoreVideo pixel format.
-     * @return A retained sample buffer, or nil when conversion fails.
-     */
-    CMSampleBufferRef sample_from_cgimage(CGImageRef image, int pixel_width, int pixel_height, OSType format) {
-      if (image == nullptr || pixel_width < 2 || pixel_height < 2) {
-        return nullptr;
-      }
-
-      CVPixelBufferRef pixel = nullptr;
-      if (CVPixelBufferCreate(kCFAllocatorDefault, static_cast<size_t>(pixel_width), static_cast<size_t>(pixel_height), format, nullptr, &pixel) != kCVReturnSuccess || pixel == nullptr) {
-        return nullptr;
-      }
-
-      CVPixelBufferLockBaseAddress(pixel, 0);
-      CGColorSpaceRef colorspace = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
-      const CGBitmapInfo bitmap_info = static_cast<CGBitmapInfo>(static_cast<uint32_t>(kCGBitmapByteOrder32Little) | static_cast<uint32_t>(kCGImageAlphaPremultipliedFirst));
-      CGContextRef context = CGBitmapContextCreate(
-        CVPixelBufferGetBaseAddress(pixel),
-        static_cast<size_t>(pixel_width),
-        static_cast<size_t>(pixel_height),
-        8,
-        CVPixelBufferGetBytesPerRow(pixel),
-        colorspace,
-        bitmap_info
-      );
-      if (colorspace != nullptr) {
-        CGColorSpaceRelease(colorspace);
-      }
-      if (context == nullptr) {
-        CVPixelBufferUnlockBaseAddress(pixel, 0);
-        CFRelease(pixel);
-        return nullptr;
-      }
-
-      CGContextSetInterpolationQuality(context, kCGInterpolationMedium);
-      CGContextDrawImage(context, CGRectMake(0, 0, pixel_width, pixel_height), image);
-      CGContextRelease(context);
-      CVPixelBufferUnlockBaseAddress(pixel, 0);
-
-      CMVideoFormatDescriptionRef description = nullptr;
-      if (CMVideoFormatDescriptionCreateForImageBuffer(kCFAllocatorDefault, pixel, &description) != noErr || description == nullptr) {
-        CFRelease(pixel);
-        return nullptr;
-      }
-
-      CMSampleTimingInfo timing {
-        kCMTimeInvalid,
-        kCMTimeInvalid,
-        kCMTimeInvalid,
-      };
-      CMSampleBufferRef sample = nullptr;
-      const OSStatus status = CMSampleBufferCreateForImageBuffer(kCFAllocatorDefault, pixel, true, nullptr, nullptr, description, &timing, &sample);
-      CFRelease(description);
-      CFRelease(pixel);
-      if (status != noErr) {
-        return nullptr;
-      }
-      return sample;
-    }
-
-    /**
-     * @brief Capture one window when ScreenCaptureKit suspends live frames.
-     *
-     * Uses the legacy CoreGraphics window image API through `dlsym` so the macOS 15 SDK unavailability
-     * attribute does not block the build. That path can still read a covered window without moving it.
-     * The caller releases the sample.
-     *
-     * @param window_id Window to capture.
-     * @param pixel_width Output width.
-     * @param pixel_height Output height.
-     * @param format CoreVideo pixel format.
-     * @return A retained sample buffer, or nil when the snapshot fails.
-     */
-    CMSampleBufferRef window_snapshot_sample(std::uint32_t window_id, int pixel_width, int pixel_height, OSType format) {
-      if (window_id == 0 || pixel_width < 2 || pixel_height < 2) {
-        return nullptr;
-      }
-
-      const auto create_image = window_list_create_image();
-      if (create_image == nullptr) {
-        return nullptr;
-      }
-
-      CGImageRef image = create_image(
-        CGRectNull,
-        kCGWindowListOptionIncludingWindow,
-        static_cast<CGWindowID>(window_id),
-        static_cast<CGWindowImageOption>(kCGWindowImageBoundsIgnoreFraming | kCGWindowImageShouldBeOpaque)
-      );
-      if (image == nullptr) {
-        return nullptr;
-      }
-
-      CMSampleBufferRef sample = sample_from_cgimage(image, pixel_width, pixel_height, format);
-      CGImageRelease(image);
       return sample;
     }
 
@@ -1058,8 +941,8 @@ namespace platf {
           return capture_e::capture_error;
         }
         while (output->signal != nullptr && dispatch_semaphore_wait(output->signal, dispatch_time(DISPATCH_TIME_NOW, 250 * NSEC_PER_MSEC)) != 0) {
-          // Suspended windows stop producing frames until they are moved onto the current Space again.
-          // Keep checking whether the session ended, otherwise this thread never returns and Sunshine aborts.
+          // ScreenCaptureKit can pause frames while the host display is idle. Keep checking whether the
+          // session ended, otherwise this thread never returns and Sunshine aborts.
           if (!on_video(nullptr)) {
             reason.store(static_cast<int>(stop_reason_e::interrupted));
             break;
@@ -1147,48 +1030,13 @@ namespace platf {
     bool cursor_applied {true};  ///< Cursor visibility last sent to ScreenCaptureKit.
     std::function<bool(CMSampleBufferRef)> video_fn;  ///< Video callback used by the current stream.
     std::mutex stream_mutex;  ///< Keeps encoder setup from opening a second stream.
-    std::chrono::steady_clock::time_point last_window_snapshot {};  ///< Last CoreGraphics fallback frame.
-
-    /**
-     * @brief Publish a CoreGraphics snapshot when ScreenCaptureKit has no live frame.
-     *
-     * @param pull_free_image_cb Callback that supplies a free image.
-     * @param push_captured_image_cb Callback that publishes the filled image.
-     * @return `false` when capture should stop.
-     */
-    bool publish_window_snapshot(
-      const pull_free_image_cb_t &pull_free_image_cb,
-      const push_captured_image_cb_t &push_captured_image_cb
-    ) {
-      if (match.window_id == 0) {
-        std::shared_ptr<img_t> empty;
-        return push_captured_image_cb(std::move(empty), false);
-      }
-
-      const auto min_interval = std::chrono::milliseconds(std::max(8, 1000 / std::max(frame_rate, 1)));
-      const auto now = std::chrono::steady_clock::now();
-      if (now - last_window_snapshot < min_interval) {
-        std::shared_ptr<img_t> empty;
-        return push_captured_image_cb(std::move(empty), false);
-      }
-      last_window_snapshot = now;
-
-      CMSampleBufferRef sample = window_snapshot_sample(match.window_id, std::max(width, 2), std::max(height, 2), pixel_format);
-      if (sample == nullptr) {
-        std::shared_ptr<img_t> empty;
-        return push_captured_image_cb(std::move(empty), false);
-      }
-      const bool ok = publish_sample(sample, pull_free_image_cb, push_captured_image_cb);
-      CFRelease(sample);
-      return ok;
-    }
 
     capture_e capture(const push_captured_image_cb_t &push_captured_image_cb, const pull_free_image_cb_t &pull_free_image_cb, bool *cursor) override {
       cursor_visible = cursor;
       return run_stream([&](CMSampleBufferRef sample) {
         if (sample == nullptr || frame_status(sample) == SCFrameStatusIdle || frame_status(sample) == SCFrameStatusBlank || frame_status(sample) == SCFrameStatusSuspended) {
-          // Do not move the game onto the user's Space. Snapshot the window where it already is.
-          return publish_window_snapshot(pull_free_image_cb, push_captured_image_cb);
+          std::shared_ptr<img_t> empty;
+          return push_captured_image_cb(std::move(empty), false);
         }
         if (!refresh_geometry()) {
           return false;
