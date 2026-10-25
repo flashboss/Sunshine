@@ -22,7 +22,9 @@
 
 // platform includes
 #import <AppKit/AppKit.h>
+#import <CoreGraphics/CoreGraphics.h>
 #import <CoreMedia/CoreMedia.h>
+#import <CoreVideo/CoreVideo.h>
 #import <ScreenCaptureKit/ScreenCaptureKit.h>
 
 // local includes
@@ -130,6 +132,121 @@ namespace platf {
       if (status != noErr) {
         return nullptr;
       }
+      return sample;
+    }
+
+    /**
+     * @brief Load the legacy window-image API that the macOS 15 SDK marks unavailable.
+     *
+     * @return Function pointer, or null when the symbol is missing.
+     */
+    auto window_list_create_image() {
+      using fn_t = CGImageRef (*)(CGRect, CGWindowListOption, CGWindowID, CGWindowImageOption);
+      static const fn_t fn = reinterpret_cast<fn_t>(dlsym(RTLD_DEFAULT, "CGWindowListCreateImage"));
+      return fn;
+    }
+
+    /**
+     * @brief Turn a CGImage into a video sample at the stream resolution.
+     *
+     * @param image Source image. Retained ownership stays with the caller.
+     * @param pixel_width Output width.
+     * @param pixel_height Output height.
+     * @param format CoreVideo pixel format.
+     * @return A retained sample buffer, or nil when conversion fails.
+     */
+    CMSampleBufferRef sample_from_cgimage(CGImageRef image, int pixel_width, int pixel_height, OSType format) {
+      if (image == nullptr || pixel_width < 2 || pixel_height < 2) {
+        return nullptr;
+      }
+
+      CVPixelBufferRef pixel = nullptr;
+      if (CVPixelBufferCreate(kCFAllocatorDefault, static_cast<size_t>(pixel_width), static_cast<size_t>(pixel_height), format, nullptr, &pixel) != kCVReturnSuccess || pixel == nullptr) {
+        return nullptr;
+      }
+
+      CVPixelBufferLockBaseAddress(pixel, 0);
+      CGColorSpaceRef colorspace = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
+      const CGBitmapInfo bitmap_info = static_cast<CGBitmapInfo>(static_cast<uint32_t>(kCGBitmapByteOrder32Little) | static_cast<uint32_t>(kCGImageAlphaPremultipliedFirst));
+      CGContextRef context = CGBitmapContextCreate(
+        CVPixelBufferGetBaseAddress(pixel),
+        static_cast<size_t>(pixel_width),
+        static_cast<size_t>(pixel_height),
+        8,
+        CVPixelBufferGetBytesPerRow(pixel),
+        colorspace,
+        bitmap_info
+      );
+      if (colorspace != nullptr) {
+        CGColorSpaceRelease(colorspace);
+      }
+      if (context == nullptr) {
+        CVPixelBufferUnlockBaseAddress(pixel, 0);
+        CFRelease(pixel);
+        return nullptr;
+      }
+
+      CGContextSetInterpolationQuality(context, kCGInterpolationMedium);
+      CGContextDrawImage(context, CGRectMake(0, 0, pixel_width, pixel_height), image);
+      CGContextRelease(context);
+      CVPixelBufferUnlockBaseAddress(pixel, 0);
+
+      CMVideoFormatDescriptionRef description = nullptr;
+      if (CMVideoFormatDescriptionCreateForImageBuffer(kCFAllocatorDefault, pixel, &description) != noErr || description == nullptr) {
+        CFRelease(pixel);
+        return nullptr;
+      }
+
+      CMSampleTimingInfo timing {
+        kCMTimeInvalid,
+        kCMTimeInvalid,
+        kCMTimeInvalid,
+      };
+      CMSampleBufferRef sample = nullptr;
+      const OSStatus status = CMSampleBufferCreateForImageBuffer(kCFAllocatorDefault, pixel, true, nullptr, nullptr, description, &timing, &sample);
+      CFRelease(description);
+      CFRelease(pixel);
+      if (status != noErr) {
+        return nullptr;
+      }
+      return sample;
+    }
+
+    /**
+     * @brief Capture one window when ScreenCaptureKit suspends live frames.
+     *
+     * Uses the legacy CoreGraphics window image API through `dlsym` so the macOS 15 SDK unavailability
+     * attribute does not block the build. That path can still read a covered window without moving it.
+     * The caller releases the sample.
+     *
+     * @param window_id Window to capture.
+     * @param pixel_width Output width.
+     * @param pixel_height Output height.
+     * @param format CoreVideo pixel format.
+     * @return A retained sample buffer, or nil when the snapshot fails.
+     */
+    CMSampleBufferRef window_snapshot_sample(std::uint32_t window_id, int pixel_width, int pixel_height, OSType format) {
+      if (window_id == 0 || pixel_width < 2 || pixel_height < 2) {
+        return nullptr;
+      }
+
+      const auto create_image = window_list_create_image();
+      if (create_image == nullptr) {
+        return nullptr;
+      }
+
+      CGImageRef image = create_image(
+        CGRectNull,
+        kCGWindowListOptionIncludingWindow,
+        static_cast<CGWindowID>(window_id),
+        static_cast<CGWindowImageOption>(kCGWindowImageBoundsIgnoreFraming | kCGWindowImageShouldBeOpaque)
+      );
+      if (image == nullptr) {
+        return nullptr;
+      }
+
+      CMSampleBufferRef sample = sample_from_cgimage(image, pixel_width, pixel_height, format);
+      CGImageRelease(image);
       return sample;
     }
 
@@ -449,289 +566,12 @@ namespace platf {
     }
 
     /**
-     * @brief SkyLight calls used to hide a captured window on the host while streaming it.
-     */
-    struct sky_light_t {
-      int (*connection)();  ///< Connection used by the other calls.
-      int (*set_level)(int connection, std::uint32_t window, int level);  ///< Changes a window's z level.
-      int (*get_level)(int connection, std::uint32_t window, int *level);  ///< Reads a window's z level.
-      int (*set_alpha)(int connection, std::uint32_t window, float alpha);  ///< Changes a window's opacity.
-      int (*get_alpha)(int connection, std::uint32_t window, float *alpha);  ///< Reads a window's opacity.
-      CFArrayRef (*spaces_for_windows)(int connection, int selector, CFArrayRef windows);  ///< Spaces that contain the given windows.
-      CFStringRef (*display_for_window)(int connection, std::uint32_t window);  ///< Display that contains a window.
-      std::uint64_t (*current_space)(int connection, CFStringRef display);  ///< Space the user is looking at on a display.
-      void (*move_windows)(int connection, CFArrayRef windows, std::uint64_t space);  ///< Moves windows onto a space.
-    };
-
-    /**
-     * @brief Load the SkyLight functions once.
+     * @brief No-op focus hook for application capture.
      *
-     * @return Loaded functions. Missing entries stay null.
-     */
-    const sky_light_t &sky_light() {
-      static const sky_light_t functions = [] {
-        sky_light_t loaded {};
-        void *handle = dlopen("/System/Library/PrivateFrameworks/SkyLight.framework/SkyLight", RTLD_LAZY);
-        if (handle == nullptr) {
-          return loaded;
-        }
-        loaded.connection = reinterpret_cast<decltype(loaded.connection)>(dlsym(handle, "SLSMainConnectionID"));
-        loaded.set_level = reinterpret_cast<decltype(loaded.set_level)>(dlsym(handle, "SLSSetWindowLevel"));
-        loaded.get_level = reinterpret_cast<decltype(loaded.get_level)>(dlsym(handle, "SLSGetWindowLevel"));
-        loaded.set_alpha = reinterpret_cast<decltype(loaded.set_alpha)>(dlsym(handle, "SLSSetWindowAlpha"));
-        loaded.get_alpha = reinterpret_cast<decltype(loaded.get_alpha)>(dlsym(handle, "SLSGetWindowAlpha"));
-        loaded.spaces_for_windows = reinterpret_cast<decltype(loaded.spaces_for_windows)>(dlsym(handle, "SLSCopySpacesForWindows"));
-        loaded.display_for_window = reinterpret_cast<decltype(loaded.display_for_window)>(dlsym(handle, "SLSCopyManagedDisplayForWindow"));
-        loaded.current_space = reinterpret_cast<decltype(loaded.current_space)>(dlsym(handle, "SLSManagedDisplayGetCurrentSpace"));
-        loaded.move_windows = reinterpret_cast<decltype(loaded.move_windows)>(dlsym(handle, "SLSMoveWindowsToManagedSpace"));
-        return loaded;
-      }();
-      return functions;
-    }
-
-    /**
-     * @brief Where a captured window was before it was hidden on the local desktop.
-     */
-    struct parked_window_t {
-      std::uint32_t window {0};  ///< Window whose level and opacity were changed.
-      std::uint64_t original_space {0};  ///< Space to restore when capture ends.
-      int original_level {0};  ///< Level to restore when capture ends.
-      float original_alpha {1.0F};  ///< Opacity to restore when capture ends.
-      bool moved {false};  ///< Whether the window was moved onto the user's current space.
-      bool alpha_saved {false};  ///< Whether original_alpha was read from the window.
-    };
-
-    std::mutex parked_window_mutex;  ///< Guards the parked captured window.
-    parked_window_t parked_window;  ///< Window restored when capture ends.
-
-    /**
-     * @brief Wrap one window id for SkyLight space calls.
-     *
-     * @param window Window id.
-     * @return Array the caller releases, or `nullptr` when the number cannot be created.
-     */
-    CFArrayRef window_array(std::uint32_t window) {
-      auto window_value = static_cast<int>(window);
-      CFNumberRef number = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt32Type, &window_value);
-      if (number == nullptr) {
-        return nullptr;
-      }
-      CFArrayRef windows = CFArrayCreate(kCFAllocatorDefault, (const void **) &number, 1, &kCFTypeArrayCallBacks);
-      CFRelease(number);
-      return windows;
-    }
-
-    /**
-     * @brief Read the first space that contains a window.
-     *
-     * @param connection SkyLight connection.
-     * @param window Window id.
-     * @return Space id, or zero when it cannot be read.
-     */
-    std::uint64_t window_space(int connection, std::uint32_t window) {
-      const auto &sky = sky_light();
-      if (sky.spaces_for_windows == nullptr || window == 0) {
-        return 0;
-      }
-      CFArrayRef windows = window_array(window);
-      if (windows == nullptr) {
-        return 0;
-      }
-      CFArrayRef spaces = sky.spaces_for_windows(connection, 0x7, windows);
-      CFRelease(windows);
-      std::uint64_t space = 0;
-      if (spaces != nullptr && CFArrayGetCount(spaces) > 0) {
-        CFNumberGetValue(static_cast<CFNumberRef>(CFArrayGetValueAtIndex(spaces, 0)), kCFNumberSInt64Type, &space);
-      }
-      if (spaces != nullptr) {
-        CFRelease(spaces);
-      }
-      return space;
-    }
-
-    /**
-     * @brief Read the space the user is looking at on the window's display.
-     *
-     * @param connection SkyLight connection.
-     * @param window Window whose display is queried.
-     * @return Current space id, or zero when it cannot be read.
-     */
-    std::uint64_t current_display_space(int connection, std::uint32_t window) {
-      const auto &sky = sky_light();
-      if (sky.display_for_window == nullptr || sky.current_space == nullptr || window == 0) {
-        return 0;
-      }
-      CFStringRef display = sky.display_for_window(connection, window);
-      if (display == nullptr) {
-        return 0;
-      }
-      const auto space = sky.current_space(connection, display);
-      CFRelease(display);
-      return space;
-    }
-
-    /**
-     * @brief Move a window to a space.
-     *
-     * @param connection SkyLight connection.
-     * @param window Window to move.
-     * @param space Destination space.
-     * @return `true` when the window is on that space afterwards.
-     */
-    bool move_window_to_space(int connection, std::uint32_t window, std::uint64_t space) {
-      const auto &sky = sky_light();
-      if (sky.move_windows == nullptr || window == 0 || space == 0) {
-        return false;
-      }
-      CFArrayRef windows = window_array(window);
-      if (windows == nullptr) {
-        return false;
-      }
-      sky.move_windows(connection, windows, space);
-      CFRelease(windows);
-      return window_space(connection, window) == space;
-    }
-
-    /**
-     * @brief Put the captured window back on its original space, level, and opacity.
-     */
-    void restore_sunken_capture_window() {
-      parked_window_t parked;
-      {
-        std::lock_guard lock {parked_window_mutex};
-        parked = parked_window;
-        parked_window = {};
-      }
-      const auto &sky = sky_light();
-      if (parked.window == 0 || sky.connection == nullptr) {
-        return;
-      }
-      const auto connection = sky.connection();
-      if (parked.moved && parked.original_space != 0) {
-        move_window_to_space(connection, parked.window, parked.original_space);
-      }
-      if (sky.set_level != nullptr) {
-        sky.set_level(connection, parked.window, parked.original_level);
-      }
-      if (sky.set_alpha != nullptr && parked.alpha_saved) {
-        sky.set_alpha(connection, parked.window, parked.original_alpha);
-      }
-    }
-
-    /**
-     * @brief Hide the captured window on the host while keeping ScreenCaptureKit able to stream it.
-     *
-     * The window is moved onto the desktop the user is looking at, lowered behind normal windows, and
-     * made fully transparent. Activating it for remote input does not switch desktops or reveal content.
-     *
-     * @param window Captured window.
-     * @return `true` when the window is on the user's current desktop and prepared for hidden capture.
-     */
-    bool park_capture_window(std::uint32_t window) {
-      const auto &sky = sky_light();
-      if (window == 0 || sky.connection == nullptr || sky.set_level == nullptr) {
-        return false;
-      }
-
-      const auto connection = sky.connection();
-      const auto current = current_display_space(connection, window);
-      auto space = window_space(connection, window);
-      if (current != 0 && space != 0 && space != current) {
-        std::uint64_t original = 0;
-        {
-          std::lock_guard lock {parked_window_mutex};
-          original = parked_window.window == window ? parked_window.original_space : space;
-        }
-        if (move_window_to_space(connection, window, current)) {
-          std::lock_guard lock {parked_window_mutex};
-          if (parked_window.window != window) {
-            parked_window = {window, original != 0 ? original : space, kCGNormalWindowLevel, 1.0F, true, false};
-          }
-          parked_window.moved = true;
-          space = current;
-        }
-      }
-
-      int level = kCGNormalWindowLevel;
-      if (sky.get_level != nullptr) {
-        sky.get_level(connection, window, &level);
-      }
-      float alpha = 1.0F;
-      bool have_alpha = false;
-      if (sky.get_alpha != nullptr) {
-        have_alpha = sky.get_alpha(connection, window, &alpha) == 0;
-      }
-      {
-        std::lock_guard lock {parked_window_mutex};
-        if (parked_window.window != window) {
-          parked_window = {window, space, level, have_alpha ? alpha : 1.0F, false, have_alpha};
-        } else {
-          if (level != kCGNormalWindowLevel - 1) {
-            parked_window.original_level = level;
-          }
-          if (have_alpha && !parked_window.alpha_saved && alpha > 0.01F) {
-            parked_window.original_alpha = alpha;
-            parked_window.alpha_saved = true;
-          }
-        }
-      }
-      if (sky.set_level(connection, window, kCGNormalWindowLevel - 1) != 0) {
-        return false;
-      }
-      if (sky.set_alpha != nullptr) {
-        sky.set_alpha(connection, window, 0.0F);
-      }
-      return current != 0 && space == current;
-    }
-
-    /**
-     * @brief Hide the captured window again after AppKit orders it forward.
-     *
-     * @param window Window to hide on the host.
-     */
-    void schedule_park_capture_window(std::uint32_t window) {
-      static std::atomic<bool> scheduled {false};
-      if (scheduled.exchange(true)) {
-        return;
-      }
-      dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 40 * NSEC_PER_MSEC), dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^{
-        scheduled.store(false);
-        if (capture_source::focus_window() == window) {
-          park_capture_window(window);
-        }
-      });
-    }
-
-    /**
-     * @brief Let the captured application receive remote input without revealing it on the host.
-     *
-     * macOS discards mouse and keyboard events unless the process is active. The window is first placed
-     * on the user's current desktop, made transparent, and kept behind other windows so activation does
-     * not switch desktops or show the streamed content locally.
+     * Remote keyboard and mouse are posted with `CGEventPostToPid`. Moving the captured window onto the
+     * user's Space pulled them toward the game when a stream started.
      */
     void focus_captured_application() {
-      const auto pid = capture_source::focus_pid();
-      const auto window_id = capture_source::focus_window();
-      if (pid <= 0 || window_id == 0) {
-        return;
-      }
-
-      const bool parked = park_capture_window(window_id);
-      @autoreleasepool {
-        NSRunningApplication *application = [NSRunningApplication runningApplicationWithProcessIdentifier:pid];
-        if (application != nil && parked && !application.active) {
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wdeprecated-declarations"
-          [application activateWithOptions:NSApplicationActivateIgnoringOtherApps];
-#pragma clang diagnostic pop
-          const auto deadline = std::chrono::steady_clock::now() + 150ms;
-          while (!application.active && std::chrono::steady_clock::now() < deadline) {
-            std::this_thread::sleep_for(5ms);
-          }
-          park_capture_window(window_id);
-        }
-      }
-      schedule_park_capture_window(window_id);
     }
 
     /**
@@ -854,7 +694,6 @@ namespace platf {
     std::unique_ptr<display_device::DisplayPowerGuardInterface> display_power_guard;  ///< Keeps the display awake while capturing.
 
     ~sck_display_t() override {
-      restore_sunken_capture_window();
       lvh::detail::macos::set_event_target_pid(0);
       lvh::detail::macos::set_event_target_window(0);
       std::lock_guard<std::mutex> guard {stream_mutex};
@@ -884,7 +723,7 @@ namespace platf {
     }
 
     /**
-     * @brief Publish a matched capture target and hide it on the host.
+     * @brief Publish a matched capture target for streaming.
      *
      * @param matched Window or application match.
      */
@@ -913,9 +752,6 @@ namespace platf {
       capture_source::set_focus_pid(match.pid);
       capture_source::set_focus_window(match.window_id);
       capture_source::set_live_geometry({match.x, match.y, match.width, match.height});
-      if (match.window_id != 0 && park_capture_window(match.window_id)) {
-        BOOST_LOG(info) << "Hiding captured window "sv << match.window_id << " on the host during the stream."sv;
-      }
       BOOST_LOG(info) << "Capturing "sv << (match.application ? "application ["sv : "window ["sv)
                       << match.bundle_id << "] pid "sv << match.pid
                       << " at "sv << match.width << 'x' << match.height << " origin "sv << match.x << 'x' << match.y;
@@ -971,8 +807,7 @@ namespace platf {
     /**
      * @brief Refresh window geometry and report whether capture should stop or restart.
      *
-     * Hiding the window on the host can make ScreenCaptureKit omit it or report a zero size for a
-     * while. Keep streaming the last known target while the owning process is alive.
+     * Keep streaming the last known target while the owning process is alive.
      *
      * @return `false` when the target disappeared or its pixel size changed.
      */
@@ -992,62 +827,29 @@ namespace platf {
         }
         const auto snapshots = snapshots_from(content);
         std::optional<capture_source::match_t> matched;
-        bool same_window = false;
         if (match.window_id != 0) {
           for (const auto &window : snapshots) {
-            if (window.window_id != match.window_id) {
+            if (window.window_id != match.window_id || window.width <= 0 || window.height <= 0) {
               continue;
             }
             const bool same_owner = (match.pid > 0 && window.pid == match.pid) || (!match.bundle_id.empty() && window.bundle_id == match.bundle_id);
-            if (match.application && !same_owner && window.pid != 0) {
+            if (match.application && !same_owner) {
               continue;
             }
             matched = match;
             matched->x = window.x;
             matched->y = window.y;
-            // A hidden window may report an empty frame. Keep the last streamed size in that case.
-            if (window.width > 0 && window.height > 0) {
-              matched->width = window.width;
-              matched->height = window.height;
-            }
-            if (window.pid > 0) {
-              matched->pid = window.pid;
-            }
+            matched->width = window.width;
+            matched->height = window.height;
+            matched->pid = window.pid;
             if (!window.bundle_id.empty()) {
               matched->bundle_id = window.bundle_id;
             }
-            same_window = true;
             break;
           }
         }
         if (!matched) {
           matched = capture_source::match_target(target, snapshots);
-        }
-        if (!matched) {
-          // Owner still running, but the window list briefly omits a transparent/hidden target.
-          for (const auto &window : snapshots) {
-            const bool same_owner = (match.pid > 0 && window.pid == match.pid) || (!match.bundle_id.empty() && window.bundle_id == match.bundle_id);
-            if (!same_owner) {
-              continue;
-            }
-            matched = match;
-            if (window.window_id != 0) {
-              matched->window_id = window.window_id;
-            }
-            matched->x = window.x;
-            matched->y = window.y;
-            if (window.width > 0 && window.height > 0) {
-              matched->width = window.width;
-              matched->height = window.height;
-            }
-            if (window.pid > 0) {
-              matched->pid = window.pid;
-            }
-            if (!window.bundle_id.empty()) {
-              matched->bundle_id = window.bundle_id;
-            }
-            break;
-          }
         }
         [content release];
         if (!matched) {
@@ -1063,10 +865,6 @@ namespace platf {
         capture_source::set_live_geometry({matched->x, matched->y, matched->width, matched->height});
         capture_source::set_focus_pid(matched->pid);
         capture_source::set_focus_window(matched->window_id);
-        // Re-hide only when the streamed window changes. Repeating it every refresh can destabilize some apps.
-        if (matched->window_id != 0 && (!same_window || matched->window_id != match.window_id)) {
-          park_capture_window(matched->window_id);
-        }
         int output_width = 0;
         int output_height = 0;
         fit_output(
@@ -1137,30 +935,8 @@ namespace platf {
       std::lock_guard<std::mutex> guard {stream_mutex};
       reason.store(static_cast<int>(stop_reason_e::none));
       @autoreleasepool {
-        SCShareableContent *content = nil;
-        SCContentFilter *filter = nil;
-        const auto filter_deadline = std::chrono::steady_clock::now() + 5s;
-        while (filter == nil && std::chrono::steady_clock::now() < filter_deadline) {
-          [content release];
-          content = copy_shareable_content();
-          if (content != nil) {
-            const auto target = capture_source::stream_target();
-            const auto rematched = capture_source::match_target(target, snapshots_from(content));
-            if (rematched && target_ready(*rematched)) {
-              match = *rematched;
-              capture_source::set_focus_pid(match.pid);
-              capture_source::set_focus_window(match.window_id);
-              capture_source::set_live_geometry({match.x, match.y, match.width, match.height});
-            }
-            filter = create_filter(content);
-          }
-          if (filter == nil) {
-            if (!process_alive(match.pid) && !process_alive(capture_source::stream_target().launched_pid)) {
-              break;
-            }
-            std::this_thread::sleep_for(100ms);
-          }
-        }
+        SCShareableContent *content = copy_shareable_content();
+        SCContentFilter *filter = create_filter(content);
         if (filter == nil) {
           [content release];
           BOOST_LOG(error) << "The capture target is no longer available. Ending the session."sv;
@@ -1282,8 +1058,8 @@ namespace platf {
           return capture_e::capture_error;
         }
         while (output->signal != nullptr && dispatch_semaphore_wait(output->signal, dispatch_time(DISPATCH_TIME_NOW, 250 * NSEC_PER_MSEC)) != 0) {
-          // A lowered or hidden window can stop producing frames. Keep checking whether the session ended,
-          // otherwise this thread never returns and Sunshine aborts the process.
+          // Suspended windows stop producing frames until they are moved onto the current Space again.
+          // Keep checking whether the session ended, otherwise this thread never returns and Sunshine aborts.
           if (!on_video(nullptr)) {
             reason.store(static_cast<int>(stop_reason_e::interrupted));
             break;
@@ -1371,13 +1147,48 @@ namespace platf {
     bool cursor_applied {true};  ///< Cursor visibility last sent to ScreenCaptureKit.
     std::function<bool(CMSampleBufferRef)> video_fn;  ///< Video callback used by the current stream.
     std::mutex stream_mutex;  ///< Keeps encoder setup from opening a second stream.
+    std::chrono::steady_clock::time_point last_window_snapshot {};  ///< Last CoreGraphics fallback frame.
+
+    /**
+     * @brief Publish a CoreGraphics snapshot when ScreenCaptureKit has no live frame.
+     *
+     * @param pull_free_image_cb Callback that supplies a free image.
+     * @param push_captured_image_cb Callback that publishes the filled image.
+     * @return `false` when capture should stop.
+     */
+    bool publish_window_snapshot(
+      const pull_free_image_cb_t &pull_free_image_cb,
+      const push_captured_image_cb_t &push_captured_image_cb
+    ) {
+      if (match.window_id == 0) {
+        std::shared_ptr<img_t> empty;
+        return push_captured_image_cb(std::move(empty), false);
+      }
+
+      const auto min_interval = std::chrono::milliseconds(std::max(8, 1000 / std::max(frame_rate, 1)));
+      const auto now = std::chrono::steady_clock::now();
+      if (now - last_window_snapshot < min_interval) {
+        std::shared_ptr<img_t> empty;
+        return push_captured_image_cb(std::move(empty), false);
+      }
+      last_window_snapshot = now;
+
+      CMSampleBufferRef sample = window_snapshot_sample(match.window_id, std::max(width, 2), std::max(height, 2), pixel_format);
+      if (sample == nullptr) {
+        std::shared_ptr<img_t> empty;
+        return push_captured_image_cb(std::move(empty), false);
+      }
+      const bool ok = publish_sample(sample, pull_free_image_cb, push_captured_image_cb);
+      CFRelease(sample);
+      return ok;
+    }
 
     capture_e capture(const push_captured_image_cb_t &push_captured_image_cb, const pull_free_image_cb_t &pull_free_image_cb, bool *cursor) override {
       cursor_visible = cursor;
       return run_stream([&](CMSampleBufferRef sample) {
         if (sample == nullptr || frame_status(sample) == SCFrameStatusIdle || frame_status(sample) == SCFrameStatusBlank || frame_status(sample) == SCFrameStatusSuspended) {
-          std::shared_ptr<img_t> empty;
-          return push_captured_image_cb(std::move(empty), false);
+          // Do not move the game onto the user's Space. Snapshot the window where it already is.
+          return publish_window_snapshot(pull_free_image_cb, push_captured_image_cb);
         }
         if (!refresh_geometry()) {
           return false;
@@ -1538,13 +1349,9 @@ namespace platf {
 - (void)streamDidBecomeInactive:(SCStream *)stream API_AVAILABLE(macos(15.2)) {
   (void) stream;
   using namespace std::literals;
-  BOOST_LOG(info) << "The capture target is no longer available. Ending the session."sv;
-  if (self->reason != nullptr) {
-    self->reason->store(static_cast<int>(platf::stop_reason_e::interrupted));
-  }
-  if (self->signal != nullptr) {
-    dispatch_semaphore_signal(self->signal);
-  }
+  // Focusing another local app (for example Terminal) can mark the stream inactive without the
+  // captured process exiting. Keep the session alive; ScreenCaptureKit resumes when frames return.
+  BOOST_LOG(debug) << "Application capture became inactive; keeping the stream."sv;
 }
 
 @end
