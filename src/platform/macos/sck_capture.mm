@@ -15,6 +15,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <signal.h>
 #include <string>
 #include <thread>
 #include <vector>
@@ -867,51 +868,90 @@ namespace platf {
      *
      * @return `true` when a target was matched.
      */
+    /**
+     * @brief Accept a matched window once it is large enough to be the real content surface.
+     *
+     * Launchers such as ScummVM briefly expose tiny stub windows (for example 32x64). Capturing those
+     * ends the session as soon as the real window replaces them.
+     *
+     * @param candidate Matched window.
+     * @return `true` when the window is ready to stream.
+     */
+    bool target_ready(const capture_source::match_t &candidate) {
+      constexpr int min_width = 200;
+      constexpr int min_height = 150;
+      return candidate.width >= min_width && candidate.height >= min_height;
+    }
+
+    /**
+     * @brief Publish a matched capture target and hide it on the host.
+     *
+     * @param matched Window or application match.
+     */
+    void adopt_match(const capture_source::match_t &matched) {
+      match = matched;
+      CGDirectDisplayID display_id = 0;
+      std::uint32_t display_count = 0;
+      const CGPoint center {static_cast<CGFloat>(match.x + match.width / 2.0), static_cast<CGFloat>(match.y + match.height / 2.0)};
+      if (CGGetDisplaysWithPoint(center, 1, &display_id, &display_count) == kCGErrorSuccess && display_count > 0) {
+        const auto bounds = CGDisplayBounds(display_id);
+        if (bounds.size.width > 0) {
+          pixel_scale = static_cast<CGFloat>(CGDisplayPixelsWide(display_id)) / bounds.size.width;
+        }
+      }
+      if (pixel_scale <= 0) {
+        pixel_scale = 1;
+      }
+      fit_output(
+        static_cast<int>(std::lround(match.width * pixel_scale)),
+        static_cast<int>(std::lround(match.height * pixel_scale)),
+        client_width,
+        client_height,
+        width,
+        height
+      );
+      capture_source::set_focus_pid(match.pid);
+      capture_source::set_focus_window(match.window_id);
+      capture_source::set_live_geometry({match.x, match.y, match.width, match.height});
+      if (match.window_id != 0 && park_capture_window(match.window_id)) {
+        BOOST_LOG(info) << "Hiding captured window "sv << match.window_id << " on the host during the stream."sv;
+      }
+      BOOST_LOG(info) << "Capturing "sv << (match.application ? "application ["sv : "window ["sv)
+                      << match.bundle_id << "] pid "sv << match.pid
+                      << " at "sv << match.width << 'x' << match.height << " origin "sv << match.x << 'x' << match.y;
+    }
+
     bool wait_for_target() {
       const auto target = capture_source::stream_target();
       BOOST_LOG(info) << "Waiting for "sv << capture_source::mode_name(target.mode) << " capture target"sv;
 
       const auto deadline = std::chrono::steady_clock::now() + 15s;
+      std::optional<capture_source::match_t> best;
       while (std::chrono::steady_clock::now() < deadline) {
         @autoreleasepool {
           SCShareableContent *content = copy_shareable_content();
           const auto matched = capture_source::match_target(target, snapshots_from(content));
           [content release];
           if (matched) {
-            match = *matched;
-            CGDirectDisplayID display_id = 0;
-            std::uint32_t display_count = 0;
-            const CGPoint center {static_cast<CGFloat>(match.x + match.width / 2.0), static_cast<CGFloat>(match.y + match.height / 2.0)};
-            if (CGGetDisplaysWithPoint(center, 1, &display_id, &display_count) == kCGErrorSuccess && display_count > 0) {
-              const auto bounds = CGDisplayBounds(display_id);
-              if (bounds.size.width > 0) {
-                pixel_scale = static_cast<CGFloat>(CGDisplayPixelsWide(display_id)) / bounds.size.width;
-              }
+            if (!best || matched->width * matched->height > best->width * best->height) {
+              best = matched;
             }
-            if (pixel_scale <= 0) {
-              pixel_scale = 1;
+            if (target_ready(*matched)) {
+              adopt_match(*matched);
+              return true;
             }
-            fit_output(
-              static_cast<int>(std::lround(match.width * pixel_scale)),
-              static_cast<int>(std::lround(match.height * pixel_scale)),
-              client_width,
-              client_height,
-              width,
-              height
-            );
-            capture_source::set_focus_pid(match.pid);
-            capture_source::set_focus_window(match.window_id);
-            capture_source::set_live_geometry({match.x, match.y, match.width, match.height});
-            if (match.window_id != 0 && park_capture_window(match.window_id)) {
-              BOOST_LOG(info) << "Hiding captured window "sv << match.window_id << " on the host during the stream."sv;
-            }
-            BOOST_LOG(info) << "Capturing "sv << (match.application ? "application ["sv : "window ["sv)
-                            << match.bundle_id << "] pid "sv << match.pid
-                            << " at "sv << match.width << 'x' << match.height << " origin "sv << match.x << 'x' << match.y;
-            return true;
+            BOOST_LOG(debug) << "Ignoring undersized capture candidate "sv << matched->width << 'x' << matched->height
+                             << " for ["sv << matched->bundle_id << ']';
           }
         }
         std::this_thread::sleep_for(200ms);
+      }
+
+      if (best) {
+        BOOST_LOG(warning) << "Using undersized capture target "sv << best->width << 'x' << best->height
+                           << " because no larger window appeared in time."sv;
+        adopt_match(*best);
+        return true;
       }
 
       BOOST_LOG(error) << "The capture target did not appear. The session will end without capturing the display."sv;
@@ -919,7 +959,20 @@ namespace platf {
     }
 
     /**
+     * @brief Report whether a process is still running.
+     *
+     * @param pid Process id.
+     * @return `true` when the process can be signaled.
+     */
+    bool process_alive(std::int32_t pid) {
+      return pid > 0 && ::kill(pid, 0) == 0;
+    }
+
+    /**
      * @brief Refresh window geometry and report whether capture should stop or restart.
+     *
+     * Hiding the window on the host can make ScreenCaptureKit omit it or report a zero size for a
+     * while. Keep streaming the last known target while the owning process is alive.
      *
      * @return `false` when the target disappeared or its pixel size changed.
      */
@@ -939,32 +992,69 @@ namespace platf {
         }
         const auto snapshots = snapshots_from(content);
         std::optional<capture_source::match_t> matched;
+        bool same_window = false;
         if (match.window_id != 0) {
           for (const auto &window : snapshots) {
-            if (window.window_id != match.window_id || window.width <= 0 || window.height <= 0) {
+            if (window.window_id != match.window_id) {
               continue;
             }
             const bool same_owner = (match.pid > 0 && window.pid == match.pid) || (!match.bundle_id.empty() && window.bundle_id == match.bundle_id);
-            if (match.application && !same_owner) {
+            if (match.application && !same_owner && window.pid != 0) {
               continue;
             }
             matched = match;
             matched->x = window.x;
             matched->y = window.y;
-            matched->width = window.width;
-            matched->height = window.height;
-            matched->pid = window.pid;
+            // A hidden window may report an empty frame. Keep the last streamed size in that case.
+            if (window.width > 0 && window.height > 0) {
+              matched->width = window.width;
+              matched->height = window.height;
+            }
+            if (window.pid > 0) {
+              matched->pid = window.pid;
+            }
             if (!window.bundle_id.empty()) {
               matched->bundle_id = window.bundle_id;
             }
+            same_window = true;
             break;
           }
         }
         if (!matched) {
           matched = capture_source::match_target(target, snapshots);
         }
+        if (!matched) {
+          // Owner still running, but the window list briefly omits a transparent/hidden target.
+          for (const auto &window : snapshots) {
+            const bool same_owner = (match.pid > 0 && window.pid == match.pid) || (!match.bundle_id.empty() && window.bundle_id == match.bundle_id);
+            if (!same_owner) {
+              continue;
+            }
+            matched = match;
+            if (window.window_id != 0) {
+              matched->window_id = window.window_id;
+            }
+            matched->x = window.x;
+            matched->y = window.y;
+            if (window.width > 0 && window.height > 0) {
+              matched->width = window.width;
+              matched->height = window.height;
+            }
+            if (window.pid > 0) {
+              matched->pid = window.pid;
+            }
+            if (!window.bundle_id.empty()) {
+              matched->bundle_id = window.bundle_id;
+            }
+            break;
+          }
+        }
         [content release];
         if (!matched) {
+          if (process_alive(match.pid) || process_alive(target.launched_pid)) {
+            BOOST_LOG(debug) << "Capture target was missing from ScreenCaptureKit briefly; keeping the stream."sv;
+            return true;
+          }
           BOOST_LOG(info) << "The capture target is no longer available. Ending the session."sv;
           reason.store(static_cast<int>(stop_reason_e::interrupted));
           return false;
@@ -973,7 +1063,8 @@ namespace platf {
         capture_source::set_live_geometry({matched->x, matched->y, matched->width, matched->height});
         capture_source::set_focus_pid(matched->pid);
         capture_source::set_focus_window(matched->window_id);
-        if (matched->window_id != 0) {
+        // Re-hide only when the streamed window changes. Repeating it every refresh can destabilize some apps.
+        if (matched->window_id != 0 && (!same_window || matched->window_id != match.window_id)) {
           park_capture_window(matched->window_id);
         }
         int output_width = 0;
@@ -1046,8 +1137,30 @@ namespace platf {
       std::lock_guard<std::mutex> guard {stream_mutex};
       reason.store(static_cast<int>(stop_reason_e::none));
       @autoreleasepool {
-        SCShareableContent *content = copy_shareable_content();
-        SCContentFilter *filter = create_filter(content);
+        SCShareableContent *content = nil;
+        SCContentFilter *filter = nil;
+        const auto filter_deadline = std::chrono::steady_clock::now() + 5s;
+        while (filter == nil && std::chrono::steady_clock::now() < filter_deadline) {
+          [content release];
+          content = copy_shareable_content();
+          if (content != nil) {
+            const auto target = capture_source::stream_target();
+            const auto rematched = capture_source::match_target(target, snapshots_from(content));
+            if (rematched && target_ready(*rematched)) {
+              match = *rematched;
+              capture_source::set_focus_pid(match.pid);
+              capture_source::set_focus_window(match.window_id);
+              capture_source::set_live_geometry({match.x, match.y, match.width, match.height});
+            }
+            filter = create_filter(content);
+          }
+          if (filter == nil) {
+            if (!process_alive(match.pid) && !process_alive(capture_source::stream_target().launched_pid)) {
+              break;
+            }
+            std::this_thread::sleep_for(100ms);
+          }
+        }
         if (filter == nil) {
           [content release];
           BOOST_LOG(error) << "The capture target is no longer available. Ending the session."sv;
