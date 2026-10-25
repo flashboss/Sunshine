@@ -484,13 +484,7 @@ namespace platf {
     return -1;
   }
 
-  // Keep the tapped application audible on the host. Muting a single-process tap has been observed
-  // to deliver only silence into the aggregate device for some apps (for example ScummVM).
-  const BOOL previous_host_audio = self.hostAudioEnabled;
-  self.hostAudioEnabled = YES;
-
   CATapDescription *tapDescription = [self createProcessTapDescriptionForProcess:process_object channels:channels];
-  self.hostAudioEnabled = previous_host_audio;
   if ([self startTapWithDescription:tapDescription sampleRate:sampleRate frameSize:frameSize channels:channels] != 0) {
     return -1;
   }
@@ -518,6 +512,10 @@ namespace platf {
   if (self.hostAudioEnabled) {
     tapDescription.muteBehavior = CATapUnmuted;
     BOOST_LOG(debug) << "Core Audio tap: Host audio enabled (unmuted)"sv;
+  } else if (self.preferMutedWhenTapped) {
+    // Mute host playback only while Sunshine is reading the tap. Immediate mute can yield silence.
+    tapDescription.muteBehavior = CATapMutedWhenTapped;
+    BOOST_LOG(debug) << "Core Audio tap: Host audio muted while tapped"sv;
   } else {
     tapDescription.muteBehavior = CATapMuted;
     BOOST_LOG(debug) << "Core Audio tap: Host audio disabled (muted)"sv;

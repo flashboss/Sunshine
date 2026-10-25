@@ -135,6 +135,7 @@ typedef struct {
 @property (nonatomic, assign, nullable) AVCaptureSession *audioCaptureSession;  ///< AVFoundation capture session for microphone input
 @property (nonatomic, assign, nullable) AVCaptureConnection *audioConnection;  ///< Audio connection within the capture session
 @property (nonatomic, assign) BOOL hostAudioEnabled;  ///< Whether host audio playback should be enabled (affects tap mute behavior)
+@property (nonatomic, assign) BOOL preferMutedWhenTapped;  ///< When host audio is disabled, mute only while the tap is being read
 
 /**
  * @brief Get all available microphone devices on the system.

@@ -36,7 +36,7 @@
 namespace lvh::detail::macos {
   void set_event_target_pid(std::int32_t pid);
   void set_event_target_window(std::uint32_t window_id);
-}
+}  // namespace lvh::detail::macos
 
 /**
  * @brief Receives ScreenCaptureKit video and audio samples.
@@ -448,12 +448,14 @@ namespace platf {
     }
 
     /**
-     * @brief SkyLight calls used to keep a captured window on the current desktop and behind other windows.
+     * @brief SkyLight calls used to hide a captured window on the host while streaming it.
      */
     struct sky_light_t {
       int (*connection)();  ///< Connection used by the other calls.
       int (*set_level)(int connection, std::uint32_t window, int level);  ///< Changes a window's z level.
       int (*get_level)(int connection, std::uint32_t window, int *level);  ///< Reads a window's z level.
+      int (*set_alpha)(int connection, std::uint32_t window, float alpha);  ///< Changes a window's opacity.
+      int (*get_alpha)(int connection, std::uint32_t window, float *alpha);  ///< Reads a window's opacity.
       CFArrayRef (*spaces_for_windows)(int connection, int selector, CFArrayRef windows);  ///< Spaces that contain the given windows.
       CFStringRef (*display_for_window)(int connection, std::uint32_t window);  ///< Display that contains a window.
       std::uint64_t (*current_space)(int connection, CFStringRef display);  ///< Space the user is looking at on a display.
@@ -475,6 +477,8 @@ namespace platf {
         loaded.connection = reinterpret_cast<decltype(loaded.connection)>(dlsym(handle, "SLSMainConnectionID"));
         loaded.set_level = reinterpret_cast<decltype(loaded.set_level)>(dlsym(handle, "SLSSetWindowLevel"));
         loaded.get_level = reinterpret_cast<decltype(loaded.get_level)>(dlsym(handle, "SLSGetWindowLevel"));
+        loaded.set_alpha = reinterpret_cast<decltype(loaded.set_alpha)>(dlsym(handle, "SLSSetWindowAlpha"));
+        loaded.get_alpha = reinterpret_cast<decltype(loaded.get_alpha)>(dlsym(handle, "SLSGetWindowAlpha"));
         loaded.spaces_for_windows = reinterpret_cast<decltype(loaded.spaces_for_windows)>(dlsym(handle, "SLSCopySpacesForWindows"));
         loaded.display_for_window = reinterpret_cast<decltype(loaded.display_for_window)>(dlsym(handle, "SLSCopyManagedDisplayForWindow"));
         loaded.current_space = reinterpret_cast<decltype(loaded.current_space)>(dlsym(handle, "SLSManagedDisplayGetCurrentSpace"));
@@ -485,13 +489,15 @@ namespace platf {
     }
 
     /**
-     * @brief Where a captured window was before input parked it behind the local desktop.
+     * @brief Where a captured window was before it was hidden on the local desktop.
      */
     struct parked_window_t {
-      std::uint32_t window {0};  ///< Window whose level was lowered.
+      std::uint32_t window {0};  ///< Window whose level and opacity were changed.
       std::uint64_t original_space {0};  ///< Space to restore when capture ends.
       int original_level {0};  ///< Level to restore when capture ends.
+      float original_alpha {1.0F};  ///< Opacity to restore when capture ends.
       bool moved {false};  ///< Whether the window was moved onto the user's current space.
+      bool alpha_saved {false};  ///< Whether original_alpha was read from the window.
     };
 
     std::mutex parked_window_mutex;  ///< Guards the parked captured window.
@@ -586,7 +592,7 @@ namespace platf {
     }
 
     /**
-     * @brief Put the captured window back on its original space and level.
+     * @brief Put the captured window back on its original space, level, and opacity.
      */
     void restore_sunken_capture_window() {
       parked_window_t parked;
@@ -606,15 +612,19 @@ namespace platf {
       if (sky.set_level != nullptr) {
         sky.set_level(connection, parked.window, parked.original_level);
       }
+      if (sky.set_alpha != nullptr && parked.alpha_saved) {
+        sky.set_alpha(connection, parked.window, parked.original_alpha);
+      }
     }
 
     /**
-     * @brief Keep the captured window behind the local user's windows.
+     * @brief Hide the captured window on the host while keeping ScreenCaptureKit able to stream it.
      *
-     * The window is moved onto the desktop the user is looking at before its level is lowered. Activating it there does not switch desktops.
+     * The window is moved onto the desktop the user is looking at, lowered behind normal windows, and
+     * made fully transparent. Activating it for remote input does not switch desktops or reveal content.
      *
      * @param window Captured window.
-     * @return `true` when the window is on the user's current desktop and behind normal windows.
+     * @return `true` when the window is on the user's current desktop and prepared for hidden capture.
      */
     bool park_capture_window(std::uint32_t window) {
       const auto &sky = sky_light();
@@ -634,7 +644,7 @@ namespace platf {
         if (move_window_to_space(connection, window, current)) {
           std::lock_guard lock {parked_window_mutex};
           if (parked_window.window != window) {
-            parked_window = {window, original != 0 ? original : space, kCGNormalWindowLevel, true};
+            parked_window = {window, original != 0 ? original : space, kCGNormalWindowLevel, 1.0F, true, false};
           }
           parked_window.moved = true;
           space = current;
@@ -645,24 +655,38 @@ namespace platf {
       if (sky.get_level != nullptr) {
         sky.get_level(connection, window, &level);
       }
+      float alpha = 1.0F;
+      bool have_alpha = false;
+      if (sky.get_alpha != nullptr) {
+        have_alpha = sky.get_alpha(connection, window, &alpha) == 0;
+      }
       {
         std::lock_guard lock {parked_window_mutex};
         if (parked_window.window != window) {
-          parked_window = {window, space, level, false};
-        } else if (level != kCGNormalWindowLevel - 1) {
-          parked_window.original_level = level;
+          parked_window = {window, space, level, have_alpha ? alpha : 1.0F, false, have_alpha};
+        } else {
+          if (level != kCGNormalWindowLevel - 1) {
+            parked_window.original_level = level;
+          }
+          if (have_alpha && !parked_window.alpha_saved && alpha > 0.01F) {
+            parked_window.original_alpha = alpha;
+            parked_window.alpha_saved = true;
+          }
         }
       }
       if (sky.set_level(connection, window, kCGNormalWindowLevel - 1) != 0) {
         return false;
       }
+      if (sky.set_alpha != nullptr) {
+        sky.set_alpha(connection, window, 0.0F);
+      }
       return current != 0 && space == current;
     }
 
     /**
-     * @brief Lower the captured window again after AppKit orders it forward.
+     * @brief Hide the captured window again after AppKit orders it forward.
      *
-     * @param window Window to lower.
+     * @param window Window to hide on the host.
      */
     void schedule_park_capture_window(std::uint32_t window) {
       static std::atomic<bool> scheduled {false};
@@ -678,9 +702,11 @@ namespace platf {
     }
 
     /**
-     * @brief Let the captured application receive remote input without switching desktops.
+     * @brief Let the captured application receive remote input without revealing it on the host.
      *
-     * macOS discards mouse and keyboard events unless the process is active. The window is first placed on the user's current desktop and behind the windows already there, so making the process active does not bring the user back to another desktop.
+     * macOS discards mouse and keyboard events unless the process is active. The window is first placed
+     * on the user's current desktop, made transparent, and kept behind other windows so activation does
+     * not switch desktops or show the streamed content locally.
      */
     void focus_captured_application() {
       const auto pid = capture_source::focus_pid();
@@ -876,6 +902,9 @@ namespace platf {
             capture_source::set_focus_pid(match.pid);
             capture_source::set_focus_window(match.window_id);
             capture_source::set_live_geometry({match.x, match.y, match.width, match.height});
+            if (match.window_id != 0 && park_capture_window(match.window_id)) {
+              BOOST_LOG(info) << "Hiding captured window "sv << match.window_id << " on the host during the stream."sv;
+            }
             BOOST_LOG(info) << "Capturing "sv << (match.application ? "application ["sv : "window ["sv)
                             << match.bundle_id << "] pid "sv << match.pid
                             << " at "sv << match.width << 'x' << match.height << " origin "sv << match.x << 'x' << match.y;
@@ -944,6 +973,9 @@ namespace platf {
         capture_source::set_live_geometry({matched->x, matched->y, matched->width, matched->height});
         capture_source::set_focus_pid(matched->pid);
         capture_source::set_focus_window(matched->window_id);
+        if (matched->window_id != 0) {
+          park_capture_window(matched->window_id);
+        }
         int output_width = 0;
         int output_height = 0;
         fit_output(

@@ -120,6 +120,7 @@ namespace platf {
     std::int32_t tapped_pid {0};  ///< Process currently attached to the tap.
     bool started {false};  ///< Whether the tap is producing samples.
     bool logged_sck_fallback {false};  ///< Whether the ScreenCaptureKit fallback was logged.
+    bool host_audio_enabled {false};  ///< Whether the tapped process should also play on the host.
 
     ~process_tap_mic_t() override {
       [av_audio_capture release];
@@ -146,9 +147,9 @@ namespace platf {
       }
 
       av_audio_capture = [[AVAudio alloc] init];
-      // Process taps stay unmuted so the aggregate device receives real samples. Other host
-      // applications are still excluded because only this pid is listed in the tap.
-      av_audio_capture.hostAudioEnabled = YES;
+      av_audio_capture.hostAudioEnabled = host_audio_enabled ? YES : NO;
+      // Mute host speakers only while the tap is consumed, so the stream still receives samples.
+      av_audio_capture.preferMutedWhenTapped = YES;
       if ([av_audio_capture setupProcessTap:pid sampleRate:sample_rate frameSize:frame_size channels:static_cast<UInt8>(channels)] != 0) {
         [av_audio_capture release];
         av_audio_capture = nil;
@@ -159,7 +160,11 @@ namespace platf {
 
       started = true;
       tapped_pid = pid;
-      BOOST_LOG(info) << "Streaming audio from application pid "sv << pid << " while other host audio stays local."sv;
+      if (host_audio_enabled) {
+        BOOST_LOG(info) << "Streaming audio from application pid "sv << pid << " while other host audio stays local."sv;
+      } else {
+        BOOST_LOG(info) << "Streaming audio from application pid "sv << pid << " and muting that app on the host."sv;
+      }
       return true;
     }
 
@@ -269,6 +274,7 @@ namespace platf {
           process_mic->sample_rate = sample_rate;
           process_mic->channels = audio_channels;
           process_mic->frame_size = frame_size;
+          process_mic->host_audio_enabled = host_audio_enabled;
           BOOST_LOG(info) << "Capturing audio from the target application."sv;
           return process_mic;
         }
