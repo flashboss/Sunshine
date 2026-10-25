@@ -224,6 +224,16 @@ namespace capture_source {
   std::int32_t focus_pid();
 
   /**
+   * @brief Return the process whose output audio should be streamed.
+   *
+   * Prefers the matched capture window owner once it is known, otherwise the process Sunshine
+   * launched for the application. Other host processes keep playing on the local speakers.
+   *
+   * @return Process id, or zero when application audio is not selected yet.
+   */
+  std::int32_t audio_pid();
+
+  /**
    * @brief Remember which captured window should stay behind the local desktop.
    *
    * @param window_id Platform window id, or zero when display capture is active.

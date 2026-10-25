@@ -2,12 +2,13 @@
  * @file src/platform/macos/av_audio.mm
  * @brief Implementation of macOS audio capture with dual input paths.
  *
- * This file implements the AVAudio class which provides two distinct audio capture methods:
+ * This file implements the AVAudio class which provides audio capture methods:
  * 1. **Microphone capture** - Uses AVFoundation framework to capture from specific microphone devices
- * 2. **System-wide audio tap** - Uses Core Audio taps to capture all system audio output (macOS 14.0+)
+ * 2. **System-wide audio tap** - Uses Core Audio taps to capture all system audio output (macOS 14.2+)
+ * 3. **Process audio tap** - Uses Core Audio taps to capture one application's output (macOS 14.2+)
  *
  * The implementation handles format conversion, real-time audio processing, and provides
- * a unified interface for both capture methods through a shared circular buffer.
+ * a unified interface for capture methods through a shared circular buffer.
  */
 // header include
 #import "av_audio.h"
@@ -24,8 +25,34 @@
 #import <AudioToolbox/AudioConverter.h>
 #import <CoreAudio/CATapDescription.h>
 
+@interface AVAudio (TapHelpers)
+- (int)startTapWithDescription:(CATapDescription *)tapDescription sampleRate:(UInt32)sampleRate frameSize:(UInt32)frameSize channels:(UInt8)channels;
+- (void)configureTapDescriptionPrivacyAndMute:(CATapDescription *)tapDescription;
+- (nullable CATapDescription *)createTapFromDescription:(CATapDescription *)tapDescription;
+@end
+
 namespace platf {
   using namespace std::literals;
+
+  AudioObjectID audio_process_object_for_pid(pid_t pid) {
+    if (pid <= 0) {
+      return kAudioObjectUnknown;
+    }
+
+    AudioObjectID process_object = kAudioObjectUnknown;
+    UInt32 size = sizeof(process_object);
+    AudioObjectPropertyAddress address {
+      kAudioHardwarePropertyTranslatePIDToProcessObject,
+      kAudioObjectPropertyScopeGlobal,
+      kAudioObjectPropertyElementMain,
+    };
+    auto lookup_pid = pid;
+    const auto status = AudioObjectGetPropertyData(kAudioObjectSystemObject, &address, sizeof(lookup_pid), &lookup_pid, &size, &process_object);
+    if (status != noErr || process_object == kAudioObjectUnknown) {
+      return kAudioObjectUnknown;
+    }
+    return process_object;
+  }
 
   bool request_microphone_permission(AVAuthorizationStatus authorization_status, const microphone_permission_request_t &request_access) {
     if (authorization_status == AVAuthorizationStatusNotDetermined) {
@@ -389,40 +416,28 @@ namespace platf {
   }
 }
 
-- (int)setupSystemTap:(UInt32)sampleRate frameSize:(UInt32)frameSize channels:(UInt8)channels {
+- (int)startTapWithDescription:(CATapDescription *)tapDescription sampleRate:(UInt32)sampleRate frameSize:(UInt32)frameSize channels:(UInt8)channels {
   using namespace std::literals;
-  BOOST_LOG(debug) << "setupSystemTap called with sampleRate:"sv << sampleRate << " frameSize:"sv << frameSize << " channels:"sv << (int) channels;
 
-  // 1. Initialize system tap components
-  if ([self initializeSystemTapContext:sampleRate frameSize:frameSize channels:channels] != 0) {
-    return -1;
-  }
-
-  // 2. Create tap description and process tap
-  CATapDescription *tapDescription = [self createSystemTapDescriptionForChannels:channels];
-  if (!tapDescription) {
+  if (tapDescription == nil) {
     [self cleanupSystemTapContext:nil];
     return -1;
   }
 
-  // 3. Create and configure aggregate device
   OSStatus aggregateStatus = [self createAggregateDeviceWithTapDescription:tapDescription sampleRate:sampleRate frameSize:frameSize];
   if (aggregateStatus != noErr) {
     [self cleanupSystemTapContext:tapDescription];
     return -1;
   }
 
-  // 4. Configure device properties and AudioConverter
   OSStatus configureStatus = [self configureDevicePropertiesAndConverter:sampleRate clientChannels:channels];
   if (configureStatus != noErr) {
     [self cleanupSystemTapContext:tapDescription];
     return -1;
   }
 
-  // 5. Initialize buffer and signal
   [self initializeAudioBuffer:channels];
 
-  // 6. Create and start IOProc
   OSStatus ioProcStatus = [self createAndStartAggregateDeviceIOProc:tapDescription];
   if (ioProcStatus != noErr) {
     [self cleanupSystemTapContext:tapDescription];
@@ -430,9 +445,85 @@ namespace platf {
   }
 
   [tapDescription release];
+  return 0;
+}
+
+- (int)setupSystemTap:(UInt32)sampleRate frameSize:(UInt32)frameSize channels:(UInt8)channels {
+  using namespace std::literals;
+  BOOST_LOG(debug) << "setupSystemTap called with sampleRate:"sv << sampleRate << " frameSize:"sv << frameSize << " channels:"sv << (int) channels;
+
+  if ([self initializeSystemTapContext:sampleRate frameSize:frameSize channels:channels] != 0) {
+    return -1;
+  }
+
+  CATapDescription *tapDescription = [self createSystemTapDescriptionForChannels:channels];
+  if ([self startTapWithDescription:tapDescription sampleRate:sampleRate frameSize:frameSize channels:channels] != 0) {
+    return -1;
+  }
 
   BOOST_LOG(debug) << "System tap setup completed successfully!"sv;
   return 0;
+}
+
+- (int)setupProcessTap:(pid_t)pid sampleRate:(UInt32)sampleRate frameSize:(UInt32)frameSize channels:(UInt8)channels {
+  using namespace std::literals;
+  BOOST_LOG(debug) << "setupProcessTap called for pid:"sv << pid << " sampleRate:"sv << sampleRate << " frameSize:"sv << frameSize << " channels:"sv << (int) channels;
+
+  if (![[NSProcessInfo processInfo] isOperatingSystemAtLeastVersion:((NSOperatingSystemVersion) {14, 2, 0})]) {
+    BOOST_LOG(error) << "Process audio capture requires macOS 14.2 or newer."sv;
+    return -1;
+  }
+
+  const auto process_object = platf::audio_process_object_for_pid(pid);
+  if (process_object == kAudioObjectUnknown) {
+    BOOST_LOG(debug) << "Process audio object is not available yet for pid "sv << pid;
+    return -1;
+  }
+
+  if ([self initializeSystemTapContext:sampleRate frameSize:frameSize channels:channels] != 0) {
+    return -1;
+  }
+
+  // Keep the tapped application audible on the host. Muting a single-process tap has been observed
+  // to deliver only silence into the aggregate device for some apps (for example ScummVM).
+  const BOOL previous_host_audio = self.hostAudioEnabled;
+  self.hostAudioEnabled = YES;
+
+  CATapDescription *tapDescription = [self createProcessTapDescriptionForProcess:process_object channels:channels];
+  self.hostAudioEnabled = previous_host_audio;
+  if ([self startTapWithDescription:tapDescription sampleRate:sampleRate frameSize:frameSize channels:channels] != 0) {
+    return -1;
+  }
+
+  BOOST_LOG(info) << "Process audio tap started for pid "sv << pid;
+  return 0;
+}
+
+- (void)configureTapDescriptionPrivacyAndMute:(CATapDescription *)tapDescription {
+  using namespace std::literals;
+
+  NSString *uniqueName = [NSString stringWithFormat:@"SunshineAVAudio-Tap-%p", (void *) self];
+  NSUUID *uniqueUUID = [[NSUUID alloc] init];
+  tapDescription.name = uniqueName;
+  tapDescription.UUID = uniqueUUID;
+
+  if (std::getenv("SUNSHINE_PUBLIC_AUDIO_TAP")) {
+    BOOST_LOG(debug) << "Setting tap as public (visible in Audio MIDI Setup and HALLab)"sv;
+    [tapDescription setPrivate:NO];
+  } else {
+    BOOST_LOG(debug) << "Setting tap as private (hidden from Audio MIDI Setup and HALLab)"sv;
+    [tapDescription setPrivate:YES];
+  }
+
+  if (self.hostAudioEnabled) {
+    tapDescription.muteBehavior = CATapUnmuted;
+    BOOST_LOG(debug) << "Core Audio tap: Host audio enabled (unmuted)"sv;
+  } else {
+    tapDescription.muteBehavior = CATapMuted;
+    BOOST_LOG(debug) << "Core Audio tap: Host audio disabled (muted)"sv;
+  }
+
+  [uniqueUUID release];
 }
 
 /**
@@ -629,48 +720,17 @@ namespace platf {
   return 0;
 }
 
-- (CATapDescription *)createSystemTapDescriptionForChannels:(UInt8)channels {
+- (CATapDescription *)createTapFromDescription:(CATapDescription *)tapDescription {
   using namespace std::literals;
 
-  BOOST_LOG(debug) << "Creating tap description for "sv << (int) channels << " channels (using stereo tap)"sv;
-  NSArray *excludeProcesses = @[];
-
-  // Always use stereo tap - it handles mono by duplicating to left/right channels
-  CATapDescription *tapDescription = [[CATapDescription alloc] initStereoGlobalTapButExcludeProcesses:excludeProcesses];
-
-  // Set unique name and UUID for this instance
-  NSString *uniqueName = [NSString stringWithFormat:@"SunshineAVAudio-Tap-%p", (void *) self];
-  NSUUID *uniqueUUID = [[NSUUID alloc] init];
-
-  tapDescription.name = uniqueName;
-  tapDescription.UUID = uniqueUUID;
-
-  if (std::getenv("SUNSHINE_PUBLIC_AUDIO_TAP")) {
-    // Shows the tap in Audio MIDI Setup and HALLab where it's easier to inspect
-    BOOST_LOG(debug) << "Setting tap as public (visible in Audio MIDI Setup and HALLab)"sv;
-    [tapDescription setPrivate:NO];
-  } else {
-    BOOST_LOG(debug) << "Setting tap as private (hidden from Audio MIDI Setup and HALLab)"sv;
-    [tapDescription setPrivate:YES];
+  if (tapDescription == nil) {
+    return nil;
   }
 
-  // Set mute behavior based on the hostAudioEnabled property
-  if (self.hostAudioEnabled) {
-    tapDescription.muteBehavior = CATapUnmuted;  // Audio to both tap and speakers
-    BOOST_LOG(debug) << "Core Audio tap: Host audio enabled (unmuted)"sv;
-  } else {
-    tapDescription.muteBehavior = CATapMuted;  // Audio to tap only, speakers muted
-    BOOST_LOG(debug) << "Core Audio tap: Host audio disabled (muted)"sv;
-  }
+  [self configureTapDescriptionPrivacyAndMute:tapDescription];
+  BOOST_LOG(debug) << "Creating process tap with name: "sv << [tapDescription.name UTF8String];
 
-  // Create the tap
-  BOOST_LOG(debug) << "Creating process tap with name: "sv << [uniqueName UTF8String];
-
-  // Use direct API call like the reference implementation
   OSStatus status = AudioHardwareCreateProcessTap(tapDescription, &self->tapObjectID);
-
-  [uniqueUUID release];
-
   if (status != noErr) {
     BOOST_LOG(error) << "AudioHardwareCreateProcessTap failed: "sv << ca::Status(status);
     [tapDescription release];
@@ -679,6 +739,27 @@ namespace platf {
 
   BOOST_LOG(debug) << "Process tap created successfully with ID: "sv << self->tapObjectID;
   return tapDescription;
+}
+
+- (CATapDescription *)createSystemTapDescriptionForChannels:(UInt8)channels {
+  using namespace std::literals;
+
+  BOOST_LOG(debug) << "Creating tap description for "sv << (int) channels << " channels (using stereo tap)"sv;
+  NSArray *excludeProcesses = @[];
+  CATapDescription *tapDescription = [[CATapDescription alloc] initStereoGlobalTapButExcludeProcesses:excludeProcesses];
+  return [self createTapFromDescription:tapDescription];
+}
+
+- (CATapDescription *)createProcessTapDescriptionForProcess:(AudioObjectID)processObjectID channels:(UInt8)channels {
+  using namespace std::literals;
+
+  if (processObjectID == kAudioObjectUnknown) {
+    return nil;
+  }
+
+  BOOST_LOG(debug) << "Creating process tap description for object "sv << processObjectID << " with "sv << (int) channels << " channels"sv;
+  CATapDescription *tapDescription = [[CATapDescription alloc] initStereoMixdownOfProcesses:@[@(processObjectID)]];
+  return [self createTapFromDescription:tapDescription];
 }
 
 - (OSStatus)createAggregateDeviceWithTapDescription:(CATapDescription *)tapDescription sampleRate:(UInt32)sampleRate frameSize:(UInt32)frameSize {

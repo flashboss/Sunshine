@@ -163,6 +163,31 @@ TEST(MacosAudioPermissionTest, SystemAudioPermissionProbeUsesUnmutedTemporaryTap
 }
 
 /**
+ * @brief Unknown or idle pids do not resolve to a Core Audio process object.
+ */
+TEST_F(AVAudioTest, AudioProcessObjectForInvalidPidIsUnknown) {
+  EXPECT_EQ(platf::audio_process_object_for_pid(0), kAudioObjectUnknown);
+  EXPECT_EQ(platf::audio_process_object_for_pid(-1), kAudioObjectUnknown);
+  EXPECT_EQ(platf::audio_process_object_for_pid(1 << 30), kAudioObjectUnknown);
+}
+
+/**
+ * @brief Process taps reject pids that are not producing audio yet.
+ */
+TEST_F(AVAudioTest, SetupProcessTapWithUnknownPidReturnsError) {
+  @try {
+    AVAudio *avAudio = [[AVAudio alloc] init];
+    avAudio.hostAudioEnabled = YES;
+    const int result = [avAudio setupProcessTap:1 << 30 sampleRate:48000 frameSize:512 channels:2];
+    [avAudio release];
+    EXPECT_EQ(result, -1);
+  }
+  @catch (NSException *exception) {
+    FAIL() << "Caught NSException: " << ([exception.reason UTF8String] ?: "unknown reason");
+  }
+}
+
+/**
  * @brief Test that setupMicrophone handles nil device input properly.
  * Verifies the method returns an error code when passed a nil device.
  */

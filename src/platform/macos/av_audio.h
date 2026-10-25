@@ -4,10 +4,11 @@
  *
  * This header defines the AVAudio class which provides distinct audio capture methods:
  * 1. **Microphone capture** - Uses AVFoundation framework to capture from specific microphone devices
- * 2. **System-wide audio tap** - Uses Core Audio taps to capture all system audio output (macOS 14.0+)
+ * 2. **System-wide audio tap** - Uses Core Audio taps to capture all system audio output (macOS 14.2+)
+ * 3. **Process audio tap** - Uses Core Audio taps to capture one application's output (macOS 14.2+)
  *
  * The system-wide audio tap allows capturing audio from all applications and system sounds,
- * while microphone capture focuses on input from physical or virtual microphone devices.
+ * while a process tap isolates the streamed application and leaves other host audio local.
  */
 #pragma once
 
@@ -50,6 +51,14 @@ namespace platf {
    * @return `true` when microphone access is authorized.
    */
   bool request_microphone_permission();
+
+  /**
+   * @brief Resolve the Core Audio process object for a BSD process id.
+   *
+   * @param pid Process id that may already be playing audio.
+   * @return Process object id, or `kAudioObjectUnknown` when the process is not tapped yet.
+   */
+  AudioObjectID audio_process_object_for_pid(pid_t pid);
 
   /**
    * @brief Provide captured PCM frames to AudioConverter.
@@ -106,9 +115,9 @@ typedef struct {
 } AVAudioIOProcData;
 
 /**
- * @brief Core Audio capture class for macOS audio input and system-wide audio tapping.
- * Provides functionality for both microphone capture via AVFoundation and system-wide
- * audio capture via Core Audio taps (requires macOS 14.0+).
+ * @brief Core Audio capture class for macOS audio input and process or system tapping.
+ * Provides microphone capture via AVFoundation and Core Audio taps for system-wide or
+ * single-process output (requires macOS 14.2+).
  */
 @interface AVAudio: NSObject <AVCaptureAudioDataOutputSampleBufferDelegate> {
 @public
@@ -158,13 +167,27 @@ typedef struct {
 
 /**
  * @brief Sets up system-wide audio tap for capturing all system audio.
- * Requires macOS 14.0+ and appropriate permissions.
+ * Requires macOS 14.2+ and appropriate permissions.
  * @param sampleRate Target sample rate in Hz
  * @param frameSize Number of frames per buffer
  * @param channels Number of audio channels
  * @return 0 on success, -1 on failure
  */
 - (int)setupSystemTap:(UInt32)sampleRate frameSize:(UInt32)frameSize channels:(UInt8)channels;
+
+/**
+ * @brief Sets up a Core Audio tap that captures only one process.
+ *
+ * Other host applications keep playing through the local speakers. When host audio is
+ * disabled, the tapped process is muted on the host so its audio is streamed only.
+ *
+ * @param pid Process id whose output should be streamed
+ * @param sampleRate Target sample rate in Hz
+ * @param frameSize Number of frames per buffer
+ * @param channels Number of audio channels
+ * @return 0 on success, -1 on failure
+ */
+- (int)setupProcessTap:(pid_t)pid sampleRate:(UInt32)sampleRate frameSize:(UInt32)frameSize channels:(UInt8)channels;
 
 // Buffer management methods for testing and internal use
 /**
@@ -199,6 +222,14 @@ typedef struct {
  * @return CATapDescription object on success, nil on failure
  */
 - (nullable CATapDescription *)createSystemTapDescriptionForChannels:(UInt8)channels;
+
+/**
+ * @brief Creates a Core Audio tap description for one process.
+ * @param processObjectID Core Audio process object for the target pid
+ * @param channels Number of audio channels to configure the tap for
+ * @return CATapDescription object on success, nil on failure
+ */
+- (nullable CATapDescription *)createProcessTapDescriptionForProcess:(AudioObjectID)processObjectID channels:(UInt8)channels;
 
 /**
  * @brief Creates an aggregate device with the specified tap description and audio parameters.

@@ -365,6 +365,14 @@ namespace capture_source {
     return focused_pid;
   }
 
+  std::int32_t audio_pid() {
+    std::lock_guard lock {state_mutex};
+    if (focused_pid > 0) {
+      return focused_pid;
+    }
+    return active_target.launched_pid;
+  }
+
   void set_focus_window(std::uint32_t window_id) {
     std::lock_guard lock {state_mutex};
     focused_window = window_id;

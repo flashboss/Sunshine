@@ -168,3 +168,20 @@ TEST(CaptureSourceTest, RemembersTheWindowThatShouldStayBehindTheDesktop) {
   capture_source::set_focus_window(0);
   EXPECT_EQ(capture_source::focus_window(), 0U);
 }
+
+TEST(CaptureSourceTest, PrefersMatchedWindowPidForApplicationAudio) {
+  capture_source::clear();
+  EXPECT_EQ(capture_source::audio_pid(), 0);
+
+  capture_source::target_t launched;
+  launched.mode = capture_source::mode_e::application;
+  launched.launched_pid = 11;
+  capture_source::activate(launched);
+  EXPECT_EQ(capture_source::audio_pid(), 11);
+
+  capture_source::set_focus_pid(22);
+  EXPECT_EQ(capture_source::audio_pid(), 22);
+
+  capture_source::clear();
+  EXPECT_EQ(capture_source::audio_pid(), 0);
+}
