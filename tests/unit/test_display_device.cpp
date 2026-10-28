@@ -725,3 +725,17 @@ TEST(DisplayDeviceRevert, RedockRestoresPendingSettings) {
   EXPECT_GE(manager_ptr->progress().revert_calls, 2);
   EXPECT_TRUE(wait_until_revert_stops());
 }
+
+TEST(DeclareUserActivityNudge, DueOnFirstCallAndWhenForcedOrIntervalElapsed) {
+  using namespace std::chrono_literals;
+
+  const auto epoch = std::chrono::steady_clock::time_point {};
+  const auto t0 = std::chrono::steady_clock::time_point {1s};
+  const auto t1 = t0 + 1s;
+  const auto t2 = t0 + 2s;
+
+  EXPECT_TRUE(display_device::user_activity_nudge_due(epoch, t0, 2s, false));
+  EXPECT_FALSE(display_device::user_activity_nudge_due(t0, t1, 2s, false));
+  EXPECT_TRUE(display_device::user_activity_nudge_due(t0, t1, 2s, true));
+  EXPECT_TRUE(display_device::user_activity_nudge_due(t0, t2, 2s, false));
+}

@@ -69,6 +69,29 @@ namespace display_device {
   [[nodiscard]] std::unique_ptr<DisplayPowerGuardInterface> keep_display_awake(const std::string &reason);
 
   /**
+   * @brief Declare remote user activity so capture backends keep producing frames.
+   * @param reason Short human-readable reason for the power assertion.
+   * @returns A guard owning the platform assertion, or nullptr if unsupported or unavailable.
+   */
+  [[nodiscard]] std::unique_ptr<DisplayPowerGuardInterface> declare_user_activity(const std::string &reason);
+
+  /**
+   * @brief Decide whether a capture session should refresh its remote-user activity assertion.
+   *
+   * @param last_nudge Time of the previous refresh, or a default-constructed clock when never refreshed.
+   * @param now Current steady clock time.
+   * @param min_interval Minimum time between non-forced refreshes.
+   * @param force Refresh even when the interval has not elapsed.
+   * @returns True when the caller should declare user activity again.
+   */
+  [[nodiscard]] bool user_activity_nudge_due(
+    std::chrono::steady_clock::time_point last_nudge,
+    std::chrono::steady_clock::time_point now,
+    std::chrono::milliseconds min_interval,
+    bool force
+  );
+
+  /**
    * @brief Configure the display device based on the user configuration and the session information.
    * @note This is a convenience method for calling similar method of a different signature.
    *

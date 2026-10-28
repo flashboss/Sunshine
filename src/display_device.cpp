@@ -929,6 +929,32 @@ namespace display_device {
     return display_power->keepDisplayAwake(reason);
   }
 
+  std::unique_ptr<DisplayPowerGuardInterface> declare_user_activity(const std::string &reason) {
+    const auto display_power {make_display_power()};
+    if (!display_power) {
+      return nullptr;
+    }
+
+    return display_power->declareUserActivity(reason);
+  }
+
+  bool user_activity_nudge_due(
+    const std::chrono::steady_clock::time_point last_nudge,
+    const std::chrono::steady_clock::time_point now,
+    const std::chrono::milliseconds min_interval,
+    const bool force
+  ) {
+    if (force) {
+      return true;
+    }
+
+    if (last_nudge.time_since_epoch().count() == 0) {
+      return true;
+    }
+
+    return now - last_nudge >= min_interval;
+  }
+
   std::string map_output_name(const std::string &output_name) {
     std::lock_guard lock {DD_DATA.mutex};
     if (!DD_DATA.sm_instance) {

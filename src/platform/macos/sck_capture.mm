@@ -22,6 +22,7 @@
 
 // platform includes
 #import <AppKit/AppKit.h>
+#import <ApplicationServices/ApplicationServices.h>
 #import <CoreMedia/CoreMedia.h>
 #import <ScreenCaptureKit/ScreenCaptureKit.h>
 
@@ -161,12 +162,14 @@ namespace platf {
      * @param sample_buffer Captured video sample.
      * @param pull_free_image_cb Callback that supplies a free image.
      * @param push_captured_image_cb Callback that publishes the filled image.
+     * @param last_video_img Receives the published Complete frame for Idle republishing.
      * @return `false` when capture should stop.
      */
     bool publish_sample(
       CMSampleBufferRef sample_buffer,
       const display_t::pull_free_image_cb_t &pull_free_image_cb,
-      const display_t::push_captured_image_cb_t &push_captured_image_cb
+      const display_t::push_captured_image_cb_t &push_captured_image_cb,
+      std::shared_ptr<img_t> &last_video_img
     ) {
       auto new_sample_buffer = std::make_shared<av_sample_buf_t>(sample_buffer);
       auto new_pixel_buffer = std::make_shared<av_pixel_buf_t>(new_sample_buffer->buf);
@@ -186,6 +189,7 @@ namespace platf {
       img_out->row_pitch = static_cast<int>(CVPixelBufferGetBytesPerRow(new_pixel_buffer->buf));
       img_out->pixel_pitch = img_out->row_pitch / img_out->width;
       old_data_retainer.reset();
+      last_video_img = img_out;
       return push_captured_image_cb(std::move(img_out), true);
     }
 
@@ -575,10 +579,103 @@ namespace platf {
     std::atomic<int> reason {static_cast<int>(stop_reason_e::none)};  ///< Why the current capture should stop.
     std::chrono::steady_clock::time_point last_geometry_check {};  ///< Last time the window list was checked for movement or closure.
     std::unique_ptr<display_device::DisplayPowerGuardInterface> display_power_guard;  ///< Keeps the display awake while capturing.
+    std::unique_ptr<display_device::DisplayPowerGuardInterface> user_activity_guard;  ///< Remote-user activity assertion that keeps ScreenCaptureKit producing frames.
+    std::chrono::steady_clock::time_point last_user_activity_nudge {};  ///< Last time remote-user activity was declared.
+    std::shared_ptr<img_t> last_video_img;  ///< Last Complete frame. Idle samples have no image buffer and must reuse this.
+
+    /**
+     * @brief Refresh the remote-user activity assertion used to keep capture frames flowing.
+     *
+     * Preventing display sleep is not enough: when the local keyboard and mouse are idle,
+     * ScreenCaptureKit can mark the stream Idle/Suspended until the host sees user activity.
+     * Targeted remote input no longer moves the desktop cursor, so capture must declare activity itself.
+     *
+     * @param force Refresh even when the throttle interval has not elapsed.
+     */
+    void nudge_user_activity(bool force = false) {
+      const auto now = std::chrono::steady_clock::now();
+      if (!display_device::user_activity_nudge_due(last_user_activity_nudge, now, 2s, force)) {
+        return;
+      }
+
+      last_user_activity_nudge = now;
+      if (auto guard = display_device::declare_user_activity("Sunshine window capture")) {
+        user_activity_guard = std::move(guard);
+      }
+    }
+
+    /**
+     * @brief Disable App Nap for a bundle so later launches keep rendering while captured.
+     *
+     * @param bundle_id Application bundle identifier.
+     */
+    void disable_app_nap(const std::string &bundle_id) {
+      if (bundle_id.empty()) {
+        return;
+      }
+
+      @autoreleasepool {
+        auto *identifier = [NSString stringWithUTF8String:bundle_id.c_str()];
+        if (identifier.length == 0) {
+          return;
+        }
+        CFPreferencesSetAppValue(CFSTR("NSAppSleepDisabled"), kCFBooleanTrue, (__bridge CFStringRef) identifier);
+        CFPreferencesAppSynchronize((__bridge CFStringRef) identifier);
+      }
+    }
+
+    /**
+     * @brief Wake a background process from App Nap without activating it.
+     *
+     * CGEvent delivery alone does not lift App Nap. An Apple Event does, which is why moving the
+     * local mouse appeared to "fix" a frozen ScummVM stream.
+     *
+     * @param pid Target process id.
+     */
+    void wake_process_apple_event(std::int32_t pid) {
+      if (pid <= 0) {
+        return;
+      }
+
+      @autoreleasepool {
+        auto *target = [NSAppleEventDescriptor descriptorWithProcessIdentifier:static_cast<pid_t>(pid)];
+        // Harmless custom event: ScummVM ignores it, macOS still treats it as process activity.
+        auto *event = [NSAppleEventDescriptor appleEventWithEventClass:static_cast<AEEventClass>('SunS')
+                                                               eventID:static_cast<AEEventID>('puls')
+                                                      targetDescriptor:target
+                                                              returnID:kAutoGenerateReturnID
+                                                         transactionID:kAnyTransactionID];
+        if (event == nil) {
+          return;
+        }
+        AESendMessage(event.aeDesc, nullptr, kAENoReply | kAENeverInteract, kAEDefaultTimeout);
+      }
+    }
+
+    /**
+     * @brief Lightweight keep-alive that does not touch the desktop cursor.
+     *
+     * HID warps were freezing the Mac mouse when ScreenCaptureKit callbacks overlapped. Smooth
+     * streaming while Idle is handled by republishing `last_video_img` instead.
+     */
+    void pulse_display_refresh() {
+      // Idle callbacks need a fresh activity assertion more often than the 2s display-sleep nudge.
+      // Otherwise ScreenCaptureKit stays Idle and we republish a stale last_video_img — the stream
+      // looks stepped even when remote mouse warps are landing in the game.
+      const auto now = std::chrono::steady_clock::now();
+      if (display_device::user_activity_nudge_due(last_user_activity_nudge, now, 100ms, false)) {
+        last_user_activity_nudge = now;
+        if (auto guard = display_device::declare_user_activity("Sunshine window capture")) {
+          user_activity_guard = std::move(guard);
+        }
+      }
+      wake_process_apple_event(match.pid);
+    }
 
     ~sck_display_t() override {
       lvh::detail::macos::set_event_target_pid(0);
       lvh::detail::macos::set_event_target_window(0);
+      CGAssociateMouseAndMouseCursorPosition(true);
       std::lock_guard<std::mutex> guard {stream_mutex};
       stop_stream();
       [output release];
@@ -612,6 +709,8 @@ namespace platf {
      */
     void adopt_match(const capture_source::match_t &matched) {
       match = matched;
+      disable_app_nap(match.bundle_id);
+      wake_process_apple_event(match.pid);
       CGDirectDisplayID display_id = 0;
       std::uint32_t display_count = 0;
       const CGPoint center {static_cast<CGFloat>(match.x + match.width / 2.0), static_cast<CGFloat>(match.y + match.height / 2.0)};
@@ -940,13 +1039,20 @@ namespace platf {
           stop_stream();
           return capture_e::capture_error;
         }
+        id capture_activity = [[NSProcessInfo processInfo]
+          beginActivityWithOptions:(NSActivityUserInitiated | NSActivityLatencyCritical)
+                            reason:@"Sunshine application capture"];
         while (output->signal != nullptr && dispatch_semaphore_wait(output->signal, dispatch_time(DISPATCH_TIME_NOW, 250 * NSEC_PER_MSEC)) != 0) {
-          // ScreenCaptureKit can pause frames while the host display is idle. Keep checking whether the
-          // session ended, otherwise this thread never returns and Sunshine aborts.
+          // ScreenCaptureKit idles when pixels are unchanged. A tiny HID refresh keeps Complete
+          // frames flowing while the captured app stays in the background. Also check for stop.
+          pulse_display_refresh();
           if (!on_video(nullptr)) {
             reason.store(static_cast<int>(stop_reason_e::interrupted));
             break;
           }
+        }
+        if (capture_activity != nil) {
+          [[NSProcessInfo processInfo] endActivity:capture_activity];
         }
         const auto stop = static_cast<stop_reason_e>(reason.load());
         stop_stream();
@@ -1034,7 +1140,19 @@ namespace platf {
     capture_e capture(const push_captured_image_cb_t &push_captured_image_cb, const pull_free_image_cb_t &pull_free_image_cb, bool *cursor) override {
       cursor_visible = cursor;
       return run_stream([&](CMSampleBufferRef sample) {
-        if (sample == nullptr || frame_status(sample) == SCFrameStatusIdle || frame_status(sample) == SCFrameStatusBlank || frame_status(sample) == SCFrameStatusSuspended) {
+        if (sample == nullptr) {
+          std::shared_ptr<img_t> empty;
+          return push_captured_image_cb(std::move(empty), false);
+        }
+        const auto status = frame_status(sample);
+        if (status == SCFrameStatusIdle || status == SCFrameStatusBlank || status == SCFrameStatusSuspended) {
+          // Idle samples have no image buffer. Republish the last Complete frame so the encoder
+          // keeps a steady cadence instead of falling into rare, stuttery updates.
+          pulse_display_refresh();
+          if (last_video_img) {
+            auto repeat = last_video_img;
+            return push_captured_image_cb(std::move(repeat), true);
+          }
           std::shared_ptr<img_t> empty;
           return push_captured_image_cb(std::move(empty), false);
         }
@@ -1042,7 +1160,7 @@ namespace platf {
           return false;
         }
         update_cursor();
-        return publish_sample(sample, pull_free_image_cb, push_captured_image_cb);
+        return publish_sample(sample, pull_free_image_cb, push_captured_image_cb, last_video_img);
       });
     }
 
@@ -1112,6 +1230,7 @@ namespace platf {
 
     auto display = std::make_shared<sck_display_t>();
     display->display_power_guard = display_device::keep_display_awake("Sunshine window capture");
+    display->nudge_user_activity(true);
     display->client_width = width;
     display->client_height = height;
     display->frame_rate = framerate > 0 ? framerate : 60;
