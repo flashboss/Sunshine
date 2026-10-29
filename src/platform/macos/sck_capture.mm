@@ -944,6 +944,8 @@ namespace platf {
         width = output_width;
         height = output_height;
         cursor_applied = shows_cursor();
+        BOOST_LOG(info) << "ScreenCaptureKit showsCursor="sv << (cursor_applied ? "true"sv : "false"sv)
+                        << " for "sv << capture_source::mode_name(capture_source::stream_target().mode) << " capture"sv;
 
         auto *configuration = [[SCStreamConfiguration alloc] init];
         configuration.width = static_cast<size_t>(width);
